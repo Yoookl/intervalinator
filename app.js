@@ -207,16 +207,44 @@ function showSaveStatus(ok){
   showSaveStatus._t = setTimeout(()=>t.classList.remove('show'), 1400);
 }
 
+/* ---------- Einstellungen (Theme/Sprache, Konto-uebergreifend) ---------- */
+let settings = { theme: null, language: null };
+let settingsSaveTimeout = null;
+
+function applyTheme(theme){
+  if(theme !== 'light' && theme !== 'dark') return;
+  document.documentElement.setAttribute('data-theme', theme);
+  try{ localStorage.setItem('intervalinator-theme', theme); }catch(e){}
+}
+
+function scheduleSettingsPersist(){
+  if(!authUser) return;
+  clearTimeout(settingsSaveTimeout);
+  settingsSaveTimeout = setTimeout(persistSettings, 400);
+}
+
+async function persistSettings(){
+  if(!authUser) return;
+  try{
+    await userDocRef().set({ settings }, { merge: true });
+  }catch(e){ /* Einstellungen sind sekundaer, kein User-Feedback noetig */ }
+}
+
 async function loadPlanForCurrentUser(){
   const key = localCacheKey();
   try{
     const doc = await userDocRef().get();
-    if(doc.exists && doc.data() && doc.data().plan){
-      state.plan = migratePlan(doc.data().plan);
+    const data = doc.exists ? doc.data() : null;
+    if(data && data.plan){
+      state.plan = migratePlan(data.plan);
     } else {
       state.plan = deepClone(DEFAULT_PLAN);
       ensureIds();
       await persistPlan();
+    }
+    if(data && data.settings){
+      settings = data.settings;
+      if(settings.theme) applyTheme(settings.theme);
     }
   }catch(e){
     if(key){
@@ -843,6 +871,7 @@ auth.onAuthStateChanged(user => {
   } else {
     authUser = null;
     state.plan = deepClone(DEFAULT_PLAN);
+    settings = { theme: null, language: null };
     ensureIds();
     render();
   }

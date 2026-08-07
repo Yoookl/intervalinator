@@ -68,10 +68,25 @@
   "day.noExercisesAlert": "Dieser Tag hat noch keine Übungen. Bitte erst hinzufügen.",
   "day.noExercisesYet": "Noch keine Übungen — füge unten welche hinzu.",
   "day.addExercise": "+ Übung",
+  "day.addWarmup": "+ Aufwärmen",
+  "day.addStretch": "+ Dehnen",
 
   "exercise.namePlaceholder": "Übung (Freitext)",
   "exercise.sets": "Sätze",
   "exercise.secondsPerSet": "Sek./Satz",
+  "exercise.durationSeconds": "Dauer (Sek.)",
+  "exercise.pauseLabel": "Pause",
+  "exercise.pauseSummary": "{value}s ({tag})",
+  "exercise.linkedTag": "global",
+  "exercise.customTag": "eigen",
+
+  "common.cancel": "Abbrechen",
+  "common.save": "Speichern",
+
+  "pauseModal.title": "Pauseneinstellungen: {name}",
+  "pauseModal.setPauseLabel": "Pause zwischen den Sätzen (Sek.)",
+  "pauseModal.afterLabel": "Pause nach der Übung (Sek.)",
+  "pauseModal.linked": "An globale Einstellung gekoppelt",
 
   "timer.pause": "Pause",
   "timer.warmup": "Aufwärmen",

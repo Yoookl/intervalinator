@@ -68,10 +68,25 @@
   "day.noExercisesAlert": "Ce jour n'a pas encore d'exercices. Veuillez en ajouter.",
   "day.noExercisesYet": "Pas encore d'exercices — ajoutez-en ci-dessous.",
   "day.addExercise": "+ Exercice",
+  "day.addWarmup": "+ Échauffement",
+  "day.addStretch": "+ Étirement",
 
   "exercise.namePlaceholder": "Exercice (texte libre)",
   "exercise.sets": "Séries",
   "exercise.secondsPerSet": "Sec./série",
+  "exercise.durationSeconds": "Durée (sec.)",
+  "exercise.pauseLabel": "Pause",
+  "exercise.pauseSummary": "{value}s ({tag})",
+  "exercise.linkedTag": "global",
+  "exercise.customTag": "perso",
+
+  "common.cancel": "Annuler",
+  "common.save": "Enregistrer",
+
+  "pauseModal.title": "Paramètres de pause : {name}",
+  "pauseModal.setPauseLabel": "Pause entre les séries (sec.)",
+  "pauseModal.afterLabel": "Pause après cet exercice (sec.)",
+  "pauseModal.linked": "Lié au paramètre global",
 
   "timer.pause": "Pause",
   "timer.warmup": "Échauffement",

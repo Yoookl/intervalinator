@@ -163,43 +163,56 @@ const LEGACY_MUSCLE_MAP = {
   "Beine":"legs", "Bauch":"abs", "Ganzkörper":"fullbody", "Cardio":"cardio", "Sonstiges":"other"
 };
 
-const CURRENT_PLAN_SCHEMA_VERSION = 2;
+const CURRENT_PLAN_SCHEMA_VERSION = 3;
+
+function makeExercise(name, muscle, sets, seconds){
+  return { name, muscle, sets, seconds, type:'exercise', pauseAfterOverride:null, setPauseOverride:null };
+}
+function makeWarmup(seconds){
+  return { name:'', muscle:null, sets:1, seconds, type:'warmup', pauseAfterOverride:null, setPauseOverride:null };
+}
+function makeStretch(seconds){
+  return { name:'', muscle:null, sets:1, seconds, type:'stretch', pauseAfterOverride:null, setPauseOverride:null };
+}
 
 const DEFAULT_PLAN = {
   schemaVersion: CURRENT_PLAN_SCHEMA_VERSION,
-  warmupSeconds: 60,
   setPauseSeconds: 60,
   pauseSeconds: 15,
-  stretchSeconds: 120,
   soundOn: true,
   days: [
     { name: "Push", exercises: [
-      { name: "Liegestütz", muscle: "chest", sets: 4, seconds: 30 },
-      { name: "Langhantel Schulterdrücken", muscle: "shoulders", sets: 4, seconds: 30 },
-      { name: "Hanteln Seitheben", muscle: "shoulders", sets: 3, seconds: 30 },
-      { name: "Trizeps mit Band", muscle: "triceps", sets: 3, seconds: 30 },
+      makeWarmup(60),
+      makeExercise("Liegestütz", "chest", 4, 30),
+      makeExercise("Langhantel Schulterdrücken", "shoulders", 4, 30),
+      makeExercise("Hanteln Seitheben", "shoulders", 3, 30),
+      makeExercise("Trizeps mit Band", "triceps", 3, 30),
+      makeStretch(120),
     ]},
     { name: "Pull", exercises: [
-      { name: "Langhantel vorgebeugtes Rudern", muscle: "back", sets: 4, seconds: 30 },
-      { name: "Band vorne auseinanderziehen", muscle: "back", sets: 3, seconds: 30 },
-      { name: "Band schräg oben-unten", muscle: "back", sets: 3, seconds: 30 },
-      { name: "Hanteln Bizeps Curls", muscle: "biceps", sets: 3, seconds: 30 },
-      { name: "Langhantel Bizeps Curls", muscle: "biceps", sets: 3, seconds: 30 },
+      makeWarmup(60),
+      makeExercise("Langhantel vorgebeugtes Rudern", "back", 4, 30),
+      makeExercise("Band vorne auseinanderziehen", "back", 3, 30),
+      makeExercise("Band schräg oben-unten", "back", 3, 30),
+      makeExercise("Hanteln Bizeps Curls", "biceps", 3, 30),
+      makeExercise("Langhantel Bizeps Curls", "biceps", 3, 30),
+      makeStretch(120),
     ]},
     { name: "Beine", exercises: [
-      { name: "Langhantel Kniebeugen", muscle: "legs", sets: 4, seconds: 30 },
-      { name: "Langhantel Ausfallschritte", muscle: "legs", sets: 3, seconds: 30 },
-      { name: "Wadenheben mit Hanteln", muscle: "legs", sets: 3, seconds: 30 },
-      { name: "Bauchrolle", muscle: "abs", sets: 3, seconds: 30 },
-      { name: "Situps", muscle: "abs", sets: 3, seconds: 30 },
-      { name: "Seitliches Bauchtraining", muscle: "abs", sets: 3, seconds: 30 },
+      makeWarmup(60),
+      makeExercise("Langhantel Kniebeugen", "legs", 4, 30),
+      makeExercise("Langhantel Ausfallschritte", "legs", 3, 30),
+      makeExercise("Wadenheben mit Hanteln", "legs", 3, 30),
+      makeExercise("Bauchrolle", "abs", 3, 30),
+      makeExercise("Situps", "abs", 3, 30),
+      makeExercise("Seitliches Bauchtraining", "abs", 3, 30),
+      makeStretch(120),
     ]},
   ]
 };
 
 const state = {
   plan: deepClone(DEFAULT_PLAN),
-  globalExpanded: false,
   expandedDayIds: new Set(),
   running: false,
   stepIndex: 0,
@@ -228,6 +241,27 @@ function migratePlan(plan){
       });
     });
     version = 2;
+  }
+  if(version < 3){
+    const legacyWarmup = plan.warmupSeconds;
+    const legacyStretch = plan.stretchSeconds;
+    (plan.days || []).forEach(d => {
+      d.exercises = d.exercises || [];
+      d.exercises.forEach(ex => {
+        if(!ex.type) ex.type = 'exercise';
+        if(ex.pauseAfterOverride === undefined) ex.pauseAfterOverride = null;
+        if(ex.setPauseOverride === undefined) ex.setPauseOverride = null;
+      });
+      if(!d.exercises.some(e => e.type === 'warmup') && legacyWarmup > 0){
+        d.exercises.unshift(makeWarmup(legacyWarmup));
+      }
+      if(!d.exercises.some(e => e.type === 'stretch') && legacyStretch > 0){
+        d.exercises.push(makeStretch(legacyStretch));
+      }
+    });
+    delete plan.warmupSeconds;
+    delete plan.stretchSeconds;
+    version = 3;
   }
   plan.schemaVersion = CURRENT_PLAN_SCHEMA_VERSION;
   return plan;
@@ -388,26 +422,36 @@ let steps = [];
 let stepStartOffsets = [];
 let stepsTotalSeconds = 0;
 
+function regularExercises(day){
+  return day.exercises.filter(e => e.type !== 'warmup' && e.type !== 'stretch');
+}
+function getWarmup(day){ return day.exercises.find(e => e.type === 'warmup'); }
+function getStretch(day){ return day.exercises.find(e => e.type === 'stretch'); }
+
 function buildSteps(day){
   const s = [];
-  if(state.plan.warmupSeconds > 0){
-    s.push({ mode:'warmup', seconds: state.plan.warmupSeconds });
+  const warmup = getWarmup(day);
+  const stretch = getStretch(day);
+  const exercises = regularExercises(day);
+
+  if(warmup && warmup.seconds > 0){
+    s.push({ mode:'warmup', seconds: warmup.seconds });
   }
-  day.exercises.forEach((ex, exIdx) => {
+  exercises.forEach((ex, exIdx) => {
     const sets = Math.max(1, ex.sets || 1);
     const secs = Math.max(1, ex.seconds || 1);
     for(let set=1; set<=sets; set++){
-      s.push({ mode:'exercise', seconds: secs, name: ex.name || '(ohne Namen)', muscle: ex.muscle, exNum: exIdx+1, totalEx: day.exercises.length, setNum: set, totalSets: sets });
-      const isLastOverall = (exIdx === day.exercises.length-1) && (set === sets);
+      s.push({ mode:'exercise', seconds: secs, name: ex.name || '(ohne Namen)', muscle: ex.muscle, exNum: exIdx+1, totalEx: exercises.length, setNum: set, totalSets: sets });
+      const isLastOverall = (exIdx === exercises.length-1) && (set === sets);
       if(!isLastOverall){
         const movingToNextExercise = (set === sets);
-        const pauseLen = Math.max(0, movingToNextExercise ? state.plan.pauseSeconds : state.plan.setPauseSeconds);
+        const pauseLen = Math.max(0, movingToNextExercise ? effectivePauseAfter(ex) : effectiveSetPause(ex));
         s.push({ mode:'pause', seconds: pauseLen });
       }
     }
   });
-  if(state.plan.stretchSeconds > 0){
-    s.push({ mode:'stretch', seconds: state.plan.stretchSeconds });
+  if(stretch && stretch.seconds > 0){
+    s.push({ mode:'stretch', seconds: stretch.seconds });
   }
   return s;
 }
@@ -433,6 +477,103 @@ function formatClock(totalSeconds){
 function formatMinSec(totalSeconds){
   const m = Math.floor(totalSeconds/60), s = totalSeconds%60;
   return `${m}:${String(s).padStart(2,'0')} ${t('common.minutesSuffix')}`;
+}
+
+/* ---------- Modal ---------- */
+// Erstes Overlay/Modal im Code. Wird an document.body gehaengt (nicht #app),
+// da render() bei jedem Aufruf #app.innerHTML leert und ein offenes Modal sonst mitreissen wuerde.
+function openModal(buildContentFn){
+  const overlay = el('div', {class:'modal-overlay'});
+  const box = el('div', {class:'modal-box'});
+
+  function close(){
+    document.removeEventListener('keydown', onKeydown);
+    overlay.remove();
+  }
+  function onKeydown(e){
+    if(e.key === 'Escape') close();
+  }
+  overlay.addEventListener('click', (e) => { if(e.target === overlay) close(); });
+  document.addEventListener('keydown', onKeydown);
+
+  box.appendChild(buildContentFn(close));
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+  return close;
+}
+
+// Baut ein Zahlenfeld + "an globale Einstellung gekoppelt"-Checkbox fuer das Pause-Modal.
+// initialValue ist immer der aktuell wirksame Wert (ob global oder eigen), damit beim Umschalten
+// des Kopplungs-Status die Zahl nicht "springt".
+function buildPauseFieldGroup(labelText, initialValue, initialLinked, onChange){
+  const wrap = el('div', {class:'modal-field'});
+  wrap.appendChild(el('div', {class:'modal-field-label'}, [labelText]));
+
+  const row = el('div', {class:'modal-field-row'});
+  const input = el('input', {type:'number', min:'0', step:'5'});
+  input.value = initialValue;
+  row.appendChild(input);
+  wrap.appendChild(row);
+
+  const toggleWrap = el('label', {class:'modal-toggle'});
+  const checkbox = el('input', {type:'checkbox'});
+  checkbox.checked = initialLinked;
+  toggleWrap.appendChild(checkbox);
+  toggleWrap.appendChild(el('span', {}, [t('pauseModal.linked')]));
+  wrap.appendChild(toggleWrap);
+
+  function emit(){
+    onChange(checkbox.checked, Math.max(0, parseInt(input.value || '0', 10)));
+  }
+  input.addEventListener('input', emit);
+  checkbox.addEventListener('change', emit);
+
+  return wrap;
+}
+
+function effectiveSetPause(ex){
+  return (ex.setPauseOverride != null) ? ex.setPauseOverride : state.plan.setPauseSeconds;
+}
+function effectivePauseAfter(ex){
+  return (ex.pauseAfterOverride != null) ? ex.pauseAfterOverride : state.plan.pauseSeconds;
+}
+
+function openPauseSettingsModal(day, ex){
+  openModal((close) => {
+    const wrap = el('div', {});
+    wrap.appendChild(el('div', {class:'modal-title'}, [t('pauseModal.title', {name: ex.name || t('exercise.namePlaceholder')})]));
+
+    let setPauseLinked = ex.setPauseOverride == null;
+    let setPauseValue = effectiveSetPause(ex);
+    wrap.appendChild(buildPauseFieldGroup(t('pauseModal.setPauseLabel'), setPauseValue, setPauseLinked, (linked, value) => {
+      setPauseLinked = linked; setPauseValue = value;
+    }));
+
+    let afterLinked = ex.pauseAfterOverride == null;
+    let afterValue = effectivePauseAfter(ex);
+    wrap.appendChild(buildPauseFieldGroup(t('pauseModal.afterLabel'), afterValue, afterLinked, (linked, value) => {
+      afterLinked = linked; afterValue = value;
+    }));
+
+    const actions = el('div', {class:'modal-actions'});
+    const cancelBtn = el('button', {class:'btn'}, [t('common.cancel')]);
+    cancelBtn.addEventListener('click', close);
+    const saveBtn = el('button', {class:'btn btn-primary'}, [t('common.save')]);
+    saveBtn.addEventListener('click', () => {
+      if(setPauseLinked){ state.plan.setPauseSeconds = setPauseValue; ex.setPauseOverride = null; }
+      else { ex.setPauseOverride = setPauseValue; }
+      if(afterLinked){ state.plan.pauseSeconds = afterValue; ex.pauseAfterOverride = null; }
+      else { ex.pauseAfterOverride = afterValue; }
+      schedulePersist();
+      close();
+      render();
+    });
+    actions.appendChild(cancelBtn);
+    actions.appendChild(saveBtn);
+    wrap.appendChild(actions);
+
+    return wrap;
+  });
 }
 
 /* ---------- Render ---------- */
@@ -533,39 +674,13 @@ function renderMainView(){
   wrap.appendChild(el('h1', {}, [t('main.title')]));
   wrap.appendChild(el('div', {class:'sub'}, [t('main.subtitle')]));
 
-  // Globale Einstellungen (einklappbar)
-  const globalCard = el('div', {class:'card'});
-  const globalHead = el('div', {class:'collapsible-head'});
-  globalHead.appendChild(el('span', {class:`chevron ${state.globalExpanded?'open':''}`}, ['▸']));
-  globalHead.appendChild(el('span', {class:'collapsible-title'}, [t('main.globalSettings')]));
-  globalHead.addEventListener('click', () => { state.globalExpanded = !state.globalExpanded; render(); });
-  globalCard.appendChild(globalHead);
-
-  if(!state.globalExpanded){
-    const p = state.plan;
-    globalCard.appendChild(el('div', {class:'collapsible-summary'}, [
-      t('main.summary', {
-        warmup: p.warmupSeconds, setPause: p.setPauseSeconds, pause: p.pauseSeconds, stretch: p.stretchSeconds,
-        sound: p.soundOn ? t('main.soundOn') : t('main.soundOff')
-      })
-    ]));
-  } else {
-    const body = el('div', {class:'collapsible-body'});
-    body.appendChild(makePlanNumberField(t('main.warmupLabel'), 'warmupSeconds', 0, 5));
-    body.appendChild(makePlanNumberField(t('main.setPauseLabel'), 'setPauseSeconds', 0, 5));
-    body.appendChild(makePlanNumberField(t('main.pauseLabel'), 'pauseSeconds', 0, 5));
-    body.appendChild(makePlanNumberField(t('main.stretchLabel'), 'stretchSeconds', 0, 5));
-
-    const soundRow = el('div', {class:'sound-toggle', style:{marginTop:'12px'}});
-    const checkbox = el('input', {type:'checkbox', id:'soundToggle'});
-    checkbox.checked = state.plan.soundOn;
-    checkbox.addEventListener('change', e => { state.plan.soundOn = e.target.checked; schedulePersist(); });
-    soundRow.appendChild(checkbox);
-    soundRow.appendChild(el('label', {for:'soundToggle'}, [t('main.soundLabel')]));
-    body.appendChild(soundRow);
-    globalCard.appendChild(body);
-  }
-  wrap.appendChild(globalCard);
+  const soundRow = el('div', {class:'sound-toggle', style:{marginBottom:'16px'}});
+  const soundCheckbox = el('input', {type:'checkbox', id:'soundToggle'});
+  soundCheckbox.checked = state.plan.soundOn;
+  soundCheckbox.addEventListener('change', e => { state.plan.soundOn = e.target.checked; schedulePersist(); });
+  soundRow.appendChild(soundCheckbox);
+  soundRow.appendChild(el('label', {for:'soundToggle'}, [t('main.soundLabel')]));
+  wrap.appendChild(soundRow);
 
   // Tage
   state.plan.days.forEach((day, dayIdx) => {
@@ -583,29 +698,6 @@ function renderMainView(){
   wrap.appendChild(addDayBtn);
 
   return wrap;
-}
-
-function makePlanNumberField(labelText, key, min, step){
-  const field = el('div', {class:'field'});
-  field.appendChild(el('label', {}, [labelText]));
-  const input = el('input', {type:'number'});
-  input.value = state.plan[key];
-  if(min !== null) input.min = String(min);
-  if(step) input.step = String(step);
-  input.addEventListener('input', e => {
-    let v = parseInt(e.target.value || '0', 10);
-    if(isNaN(v)) v = min !== null ? min : 0;
-    if(min !== null) v = Math.max(min, v);
-    state.plan[key] = v;
-    schedulePersist();
-    document.querySelectorAll('.day-total').forEach(elm => {
-      const dayId = elm.getAttribute('data-day-id');
-      const day = state.plan.days.find(d => d.id === dayId);
-      if(day) elm.textContent = t('day.totalDuration', {duration: formatMinSec(dayTotalSeconds(day))});
-    });
-  });
-  field.appendChild(input);
-  return field;
 }
 
 function renderDayCard(day, dayIdx){
@@ -648,23 +740,88 @@ function renderDayCard(day, dayIdx){
 
   if(isExpanded){
     const body = el('div', {class:'collapsible-body'});
-    if(day.exercises.length === 0){
+
+    const warmupEx = getWarmup(day);
+    if(warmupEx){
+      body.appendChild(renderSpecialRow(day, warmupEx));
+    } else {
+      const addWarmupBtn = el('button', {class:'btn add-ex-btn'}, [t('day.addWarmup')]);
+      addWarmupBtn.addEventListener('click', () => {
+        day.exercises.unshift(makeWarmup(60));
+        schedulePersist();
+        render();
+      });
+      body.appendChild(addWarmupBtn);
+    }
+
+    const regulars = regularExercises(day);
+    if(regulars.length === 0){
       body.appendChild(el('div', {class:'empty-note'}, [t('day.noExercisesYet')]));
     }
-    day.exercises.forEach((ex, exIdx) => {
-      body.appendChild(renderExerciseRow(day, ex, exIdx));
+    regulars.forEach((ex, exIdx) => {
+      body.appendChild(renderExerciseRow(day, ex, exIdx, regulars.length));
     });
     const addExBtn = el('button', {class:'btn add-ex-btn'}, [t('day.addExercise')]);
     addExBtn.addEventListener('click', () => {
-      day.exercises.push({ id: uid(), name: '', muscle: MUSCLE_GROUP_IDS[0], sets: 3, seconds: 30 });
+      const stretchEx = getStretch(day);
+      const insertAt = stretchEx ? day.exercises.indexOf(stretchEx) : day.exercises.length;
+      day.exercises.splice(insertAt, 0, makeExercise('', MUSCLE_GROUP_IDS[0], 3, 30));
       schedulePersist();
       render();
     });
     body.appendChild(addExBtn);
+
+    const stretchEx = getStretch(day);
+    if(stretchEx){
+      body.appendChild(renderSpecialRow(day, stretchEx));
+    } else {
+      const addStretchBtn = el('button', {class:'btn add-ex-btn'}, [t('day.addStretch')]);
+      addStretchBtn.addEventListener('click', () => {
+        day.exercises.push(makeStretch(120));
+        schedulePersist();
+        render();
+      });
+      body.appendChild(addStretchBtn);
+    }
+
     card.appendChild(body);
   }
 
   return card;
+}
+
+function renderSpecialRow(day, ex){
+  const row = el('div', {class:'exercise-row special-row'});
+  const content = el('div', {class:'ex-content'});
+
+  const line1 = el('div', {class:'ex-line1'});
+  line1.appendChild(el('div', {class:'special-label'}, [t(ex.type === 'warmup' ? 'timer.warmup' : 'timer.stretch')]));
+  const delBtn = el('button', {class:'icon-btn'}, ['✕']);
+  delBtn.addEventListener('click', () => {
+    const idx = day.exercises.indexOf(ex);
+    if(idx >= 0) day.exercises.splice(idx, 1);
+    schedulePersist();
+    render();
+  });
+  line1.appendChild(delBtn);
+  content.appendChild(line1);
+
+  const line2 = el('div', {class:'ex-line2'});
+  const secField = el('div', {class:'field-mini'});
+  secField.appendChild(el('label', {}, [t('exercise.durationSeconds')]));
+  const secInput = el('input', {type:'number', min:'5', step:'5'});
+  secInput.value = ex.seconds;
+  secInput.addEventListener('input', e => {
+    ex.seconds = Math.max(5, parseInt(e.target.value||'30',10));
+    schedulePersist();
+    updateDayTotalDisplay(day);
+  });
+  secField.appendChild(secInput);
+  line2.appendChild(secField);
+  content.appendChild(line2);
+
+  row.appendChild(content);
+  return row;
 }
 
 function updateDayTotalDisplay(day){
@@ -672,23 +829,25 @@ function updateDayTotalDisplay(day){
   if(elm) elm.textContent = t('day.totalDuration', {duration: formatMinSec(dayTotalSeconds(day))});
 }
 
-function renderExerciseRow(day, ex, exIdx){
+function renderExerciseRow(day, ex, exIdx, totalRegular){
   const row = el('div', {class:'exercise-row'});
 
   const reorderBox = el('div', {class:'reorder-box'});
   const upBtn = el('button', {class:'icon-btn reorder-btn'}, ['▲']);
   upBtn.disabled = (exIdx === 0);
   upBtn.addEventListener('click', () => {
-    if(exIdx === 0) return;
-    [day.exercises[exIdx-1], day.exercises[exIdx]] = [day.exercises[exIdx], day.exercises[exIdx-1]];
+    const realIdx = day.exercises.indexOf(ex);
+    if(realIdx <= 0) return;
+    [day.exercises[realIdx-1], day.exercises[realIdx]] = [day.exercises[realIdx], day.exercises[realIdx-1]];
     schedulePersist();
     render();
   });
   const downBtn = el('button', {class:'icon-btn reorder-btn'}, ['▼']);
-  downBtn.disabled = (exIdx === day.exercises.length - 1);
+  downBtn.disabled = (exIdx === totalRegular - 1);
   downBtn.addEventListener('click', () => {
-    if(exIdx === day.exercises.length - 1) return;
-    [day.exercises[exIdx+1], day.exercises[exIdx]] = [day.exercises[exIdx], day.exercises[exIdx+1]];
+    const realIdx = day.exercises.indexOf(ex);
+    if(realIdx < 0 || realIdx >= day.exercises.length - 1) return;
+    [day.exercises[realIdx+1], day.exercises[realIdx]] = [day.exercises[realIdx], day.exercises[realIdx+1]];
     schedulePersist();
     render();
   });
@@ -712,7 +871,8 @@ function renderExerciseRow(day, ex, exIdx){
 
   const delBtn = el('button', {class:'icon-btn'}, ['✕']);
   delBtn.addEventListener('click', () => {
-    day.exercises.splice(exIdx,1);
+    const realIdx = day.exercises.indexOf(ex);
+    if(realIdx >= 0) day.exercises.splice(realIdx, 1);
     schedulePersist();
     render();
   });
@@ -745,8 +905,19 @@ function renderExerciseRow(day, ex, exIdx){
   });
   secField.appendChild(secInput);
 
+  const pauseField = el('div', {class:'field-mini pause-trigger'});
+  pauseField.appendChild(el('label', {}, [t('exercise.pauseLabel')]));
+  pauseField.appendChild(el('div', {class:'pause-value'}, [
+    t('exercise.pauseSummary', {
+      value: effectivePauseAfter(ex),
+      tag: ex.pauseAfterOverride == null ? t('exercise.linkedTag') : t('exercise.customTag')
+    })
+  ]));
+  pauseField.addEventListener('click', () => openPauseSettingsModal(day, ex));
+
   line2.appendChild(setsField);
   line2.appendChild(secField);
+  line2.appendChild(pauseField);
 
   content.appendChild(line1);
   content.appendChild(line2);

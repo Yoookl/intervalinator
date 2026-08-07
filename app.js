@@ -15,14 +15,69 @@ function deepClone(x){ return JSON.parse(JSON.stringify(x)); }
 function showError(msg){
   try{
     const b = document.getElementById('errorBanner');
-    if(b){ b.style.display = 'block'; b.textContent = 'Fehler: ' + msg; }
+    if(b){ b.style.display = 'block'; b.textContent = t('error.prefix') + msg; }
   }catch(e){ /* nichts weiter möglich */ }
 }
-window.addEventListener('error', (e) => showError((e && e.message) || 'Unbekannter Fehler'));
+window.addEventListener('error', (e) => showError((e && e.message) || t('error.unknown')));
 window.addEventListener('unhandledrejection', (e) => {
   const reason = e && e.reason;
-  showError((reason && (reason.message || String(reason))) || 'Unbekannter Fehler (Promise)');
+  showError((reason && (reason.message || String(reason))) || t('error.unknownPromise'));
 });
+
+/* ---------- i18n ---------- */
+const SUPPORTED_LANGUAGES = ['en','fr','es','de'];
+const translationsCache = {};
+let currentLanguage = 'en';
+
+async function fetchTranslations(lang){
+  const res = await fetch(`locales/${lang}.json`);
+  if(!res.ok) throw new Error('Sprachdatei nicht gefunden: ' + lang);
+  return res.json();
+}
+
+async function loadLanguage(lang){
+  if(!SUPPORTED_LANGUAGES.includes(lang)) lang = 'en';
+  if(!translationsCache.en){
+    try{ translationsCache.en = await fetchTranslations('en'); }
+    catch(e){ translationsCache.en = {}; }
+  }
+  if(!translationsCache[lang]){
+    try{ translationsCache[lang] = await fetchTranslations(lang); }
+    catch(e){ translationsCache[lang] = {}; }
+  }
+  currentLanguage = lang;
+  document.documentElement.setAttribute('lang', lang);
+}
+
+function t(key, vars){
+  const dict = translationsCache[currentLanguage] || {};
+  const fallback = translationsCache.en || {};
+  let str = (key in dict) ? dict[key] : (key in fallback ? fallback[key] : key);
+  if(vars){
+    Object.entries(vars).forEach(([k,v]) => {
+      str = str.replace(new RegExp(`\\{${k}\\}`, 'g'), v);
+    });
+  }
+  return str;
+}
+
+function detectInitialLanguage(){
+  try{
+    const stored = localStorage.getItem('intervalinator-lang');
+    if(stored && SUPPORTED_LANGUAGES.includes(stored)) return stored;
+  }catch(e){}
+  const nav = ((navigator.language || 'en').split('-')[0] || 'en').toLowerCase();
+  return SUPPORTED_LANGUAGES.includes(nav) ? nav : 'en';
+}
+
+async function setLanguage(lang){
+  if(!SUPPORTED_LANGUAGES.includes(lang)) lang = 'en';
+  await loadLanguage(lang);
+  try{ localStorage.setItem('intervalinator-lang', lang); }catch(e){}
+  settings.language = lang;
+  scheduleSettingsPersist();
+  render();
+}
 
 /* ---------- Firebase ---------- */
 const firebaseConfig = {
@@ -48,17 +103,18 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 function translateAuthError(e){
   const map = {
-    'auth/invalid-email': 'Ungültige E-Mail-Adresse.',
-    'auth/user-disabled': 'Dieser Account wurde deaktiviert.',
-    'auth/user-not-found': 'Kein Account mit dieser E-Mail gefunden.',
-    'auth/wrong-password': 'Falsches Passwort.',
-    'auth/invalid-credential': 'E-Mail oder Passwort falsch.',
-    'auth/email-already-in-use': 'Diese E-Mail wird bereits verwendet.',
-    'auth/weak-password': 'Passwort ist zu schwach (mind. 6 Zeichen).',
-    'auth/too-many-requests': 'Zu viele Versuche. Bitte später erneut versuchen.',
-    'auth/network-request-failed': 'Netzwerkfehler. Bitte Verbindung prüfen.'
+    'auth/invalid-email': 'authError.invalidEmail',
+    'auth/user-disabled': 'authError.userDisabled',
+    'auth/user-not-found': 'authError.userNotFound',
+    'auth/wrong-password': 'authError.wrongPassword',
+    'auth/invalid-credential': 'authError.invalidCredential',
+    'auth/email-already-in-use': 'authError.emailInUse',
+    'auth/weak-password': 'authError.weakPassword',
+    'auth/too-many-requests': 'authError.tooManyRequests',
+    'auth/network-request-failed': 'authError.networkFailed'
   };
-  return map[e.code] || (e.message || 'Unbekannter Fehler.');
+  const key = map[e.code];
+  return key ? t(key) : (e.message || t('authError.unknown'));
 }
 
 async function handleLogin(email, password){
@@ -89,10 +145,10 @@ async function handleLogout(){
 
 async function handlePasswordReset(email){
   authError = ''; authInfo = '';
-  if(!email){ authError = 'Bitte zuerst E-Mail-Adresse eingeben.'; render(); return; }
+  if(!email){ authError = t('auth.resetEmailMissing'); render(); return; }
   try{
     await auth.sendPasswordResetEmail(email);
-    authInfo = 'E-Mail zum Zurücksetzen des Passworts wurde gesendet.';
+    authInfo = t('auth.resetEmailSent');
   }catch(e){
     authError = translateAuthError(e);
   }
@@ -100,9 +156,14 @@ async function handlePasswordReset(email){
 }
 
 /* ---------- Daten ---------- */
-const MUSCLE_GROUPS = ["Brust","Rücken","Schultern","Bizeps","Trizeps","Beine","Bauch","Ganzkörper","Cardio","Sonstiges"];
+const MUSCLE_GROUP_IDS = ["chest","back","shoulders","biceps","triceps","legs","abs","fullbody","cardio","other"];
+// Migriert alte, direkt als deutscher Anzeigetext gespeicherte Muskelgruppen-Werte (Schema v1) auf stabile IDs.
+const LEGACY_MUSCLE_MAP = {
+  "Brust":"chest", "Rücken":"back", "Schultern":"shoulders", "Bizeps":"biceps", "Trizeps":"triceps",
+  "Beine":"legs", "Bauch":"abs", "Ganzkörper":"fullbody", "Cardio":"cardio", "Sonstiges":"other"
+};
 
-const CURRENT_PLAN_SCHEMA_VERSION = 1;
+const CURRENT_PLAN_SCHEMA_VERSION = 2;
 
 const DEFAULT_PLAN = {
   schemaVersion: CURRENT_PLAN_SCHEMA_VERSION,
@@ -113,25 +174,25 @@ const DEFAULT_PLAN = {
   soundOn: true,
   days: [
     { name: "Push", exercises: [
-      { name: "Liegestütz", muscle: "Brust", sets: 4, seconds: 30 },
-      { name: "Langhantel Schulterdrücken", muscle: "Schultern", sets: 4, seconds: 30 },
-      { name: "Hanteln Seitheben", muscle: "Schultern", sets: 3, seconds: 30 },
-      { name: "Trizeps mit Band", muscle: "Trizeps", sets: 3, seconds: 30 },
+      { name: "Liegestütz", muscle: "chest", sets: 4, seconds: 30 },
+      { name: "Langhantel Schulterdrücken", muscle: "shoulders", sets: 4, seconds: 30 },
+      { name: "Hanteln Seitheben", muscle: "shoulders", sets: 3, seconds: 30 },
+      { name: "Trizeps mit Band", muscle: "triceps", sets: 3, seconds: 30 },
     ]},
     { name: "Pull", exercises: [
-      { name: "Langhantel vorgebeugtes Rudern", muscle: "Rücken", sets: 4, seconds: 30 },
-      { name: "Band vorne auseinanderziehen", muscle: "Rücken", sets: 3, seconds: 30 },
-      { name: "Band schräg oben-unten", muscle: "Rücken", sets: 3, seconds: 30 },
-      { name: "Hanteln Bizeps Curls", muscle: "Bizeps", sets: 3, seconds: 30 },
-      { name: "Langhantel Bizeps Curls", muscle: "Bizeps", sets: 3, seconds: 30 },
+      { name: "Langhantel vorgebeugtes Rudern", muscle: "back", sets: 4, seconds: 30 },
+      { name: "Band vorne auseinanderziehen", muscle: "back", sets: 3, seconds: 30 },
+      { name: "Band schräg oben-unten", muscle: "back", sets: 3, seconds: 30 },
+      { name: "Hanteln Bizeps Curls", muscle: "biceps", sets: 3, seconds: 30 },
+      { name: "Langhantel Bizeps Curls", muscle: "biceps", sets: 3, seconds: 30 },
     ]},
     { name: "Beine", exercises: [
-      { name: "Langhantel Kniebeugen", muscle: "Beine", sets: 4, seconds: 30 },
-      { name: "Langhantel Ausfallschritte", muscle: "Beine", sets: 3, seconds: 30 },
-      { name: "Wadenheben mit Hanteln", muscle: "Beine", sets: 3, seconds: 30 },
-      { name: "Bauchrolle", muscle: "Bauch", sets: 3, seconds: 30 },
-      { name: "Situps", muscle: "Bauch", sets: 3, seconds: 30 },
-      { name: "Seitliches Bauchtraining", muscle: "Bauch", sets: 3, seconds: 30 },
+      { name: "Langhantel Kniebeugen", muscle: "legs", sets: 4, seconds: 30 },
+      { name: "Langhantel Ausfallschritte", muscle: "legs", sets: 3, seconds: 30 },
+      { name: "Wadenheben mit Hanteln", muscle: "legs", sets: 3, seconds: 30 },
+      { name: "Bauchrolle", muscle: "abs", sets: 3, seconds: 30 },
+      { name: "Situps", muscle: "abs", sets: 3, seconds: 30 },
+      { name: "Seitliches Bauchtraining", muscle: "abs", sets: 3, seconds: 30 },
     ]},
   ]
 };
@@ -160,7 +221,14 @@ function ensureIds(){
 // Jede künftige Schema-Aenderung bekommt hier einen eigenen "if(version < X)"-Migrationsschritt.
 function migratePlan(plan){
   let version = plan.schemaVersion || 1;
-  // if(version < 2){ ... plan = ...; version = 2; }
+  if(version < 2){
+    (plan.days || []).forEach(d => {
+      (d.exercises || []).forEach(ex => {
+        if(ex.muscle && LEGACY_MUSCLE_MAP[ex.muscle]) ex.muscle = LEGACY_MUSCLE_MAP[ex.muscle];
+      });
+    });
+    version = 2;
+  }
   plan.schemaVersion = CURRENT_PLAN_SCHEMA_VERSION;
   return plan;
 }
@@ -198,13 +266,13 @@ async function persistPlan(){
 }
 
 function showSaveStatus(ok){
-  const t = document.getElementById('saveToast');
-  if(!t) return;
-  t.textContent = ok ? 'Gespeichert' : 'Speichern nicht möglich (nur lokal)';
-  t.style.color = ok ? '' : 'var(--danger)';
-  t.classList.add('show');
+  const t_ = document.getElementById('saveToast');
+  if(!t_) return;
+  t_.textContent = ok ? t('common.save.ok') : t('common.save.fail');
+  t_.style.color = ok ? '' : 'var(--danger)';
+  t_.classList.add('show');
   clearTimeout(showSaveStatus._t);
-  showSaveStatus._t = setTimeout(()=>t.classList.remove('show'), 1400);
+  showSaveStatus._t = setTimeout(()=>t_.classList.remove('show'), 1400);
 }
 
 /* ---------- Einstellungen (Theme/Sprache, Konto-uebergreifend) ---------- */
@@ -244,6 +312,9 @@ async function loadPlanForCurrentUser(){
     }
     if(data && data.settings){
       settings = data.settings;
+      if(settings.language && settings.language !== currentLanguage){
+        await loadLanguage(settings.language);
+      }
       if(settings.theme) applyTheme(settings.theme);
     }
   }catch(e){
@@ -355,13 +426,13 @@ function elapsedSeconds(){
   return stepStartOffsets[state.stepIndex] + (s.seconds - Math.max(0, state.remaining));
 }
 function formatClock(totalSeconds){
-  const t = Math.max(0, Math.round(totalSeconds));
-  const m = Math.floor(t/60), sec = t%60;
+  const t_ = Math.max(0, Math.round(totalSeconds));
+  const m = Math.floor(t_/60), sec = t_%60;
   return `${m}:${String(sec).padStart(2,'0')}`;
 }
 function formatMinSec(totalSeconds){
   const m = Math.floor(totalSeconds/60), s = totalSeconds%60;
-  return `${m}:${String(s).padStart(2,'0')} Min.`;
+  return `${m}:${String(s).padStart(2,'0')} ${t('common.minutesSuffix')}`;
 }
 
 /* ---------- Render ---------- */
@@ -385,7 +456,7 @@ function render(){
 
 function renderLoadingScreen(){
   const wrap = el('div', {class:'auth-wrap'});
-  wrap.appendChild(el('div', {class:'auth-sub'}, ['Lade...']));
+  wrap.appendChild(el('div', {class:'auth-sub'}, [t('common.loading')]));
   return wrap;
 }
 
@@ -393,34 +464,34 @@ function renderAuthScreen(){
   const wrap = el('div', {class:'auth-wrap'});
   const card = el('div', {class:'auth-card'});
   const isLogin = authMode === 'login';
-  card.appendChild(el('div', {class:'auth-title'}, ['Trainingsplan']));
-  card.appendChild(el('div', {class:'auth-sub'}, [isLogin ? 'Anmelden' : 'Neuen Account erstellen']));
+  card.appendChild(el('div', {class:'auth-title'}, [t('auth.title')]));
+  card.appendChild(el('div', {class:'auth-sub'}, [isLogin ? t('auth.loginSubtitle') : t('auth.registerSubtitle')]));
 
   if(authError) card.appendChild(el('div', {class:'auth-error'}, [authError]));
   if(authInfo) card.appendChild(el('div', {class:'auth-info'}, [authInfo]));
 
   const emailField = el('div', {class:'auth-field'});
-  emailField.appendChild(el('label', {}, ['E-Mail']));
+  emailField.appendChild(el('label', {}, [t('auth.email')]));
   const emailInput = el('input', {type:'email', autocomplete:'email'});
   emailField.appendChild(emailInput);
 
   const pwField = el('div', {class:'auth-field'});
-  pwField.appendChild(el('label', {}, ['Passwort']));
+  pwField.appendChild(el('label', {}, [t('auth.password')]));
   const pwInput = el('input', {type:'password', autocomplete: isLogin ? 'current-password' : 'new-password'});
   pwField.appendChild(pwInput);
-  if(!isLogin) pwField.appendChild(el('div', {class:'auth-hint'}, ['Mindestens 8 Zeichen']));
+  if(!isLogin) pwField.appendChild(el('div', {class:'auth-hint'}, [t('auth.passwordHint')]));
 
   card.appendChild(emailField);
   card.appendChild(pwField);
 
-  const submitBtn = el('button', {class:'btn btn-primary btn-block'}, [authBusy ? '...' : (isLogin ? 'Anmelden' : 'Registrieren')]);
+  const submitBtn = el('button', {class:'btn btn-primary btn-block'}, [authBusy ? t('auth.submitting') : (isLogin ? t('auth.loginButton') : t('auth.registerButton'))]);
   submitBtn.disabled = authBusy;
   submitBtn.addEventListener('click', () => {
     const email = emailInput.value.trim();
     const pw = pwInput.value;
-    if(!email || !pw){ authError = 'Bitte E-Mail und Passwort eingeben.'; render(); return; }
-    if(!EMAIL_RE.test(email)){ authError = 'Bitte eine gültige E-Mail-Adresse eingeben.'; render(); return; }
-    if(!isLogin && pw.length < 8){ authError = 'Das Passwort muss mindestens 8 Zeichen lang sein.'; render(); return; }
+    if(!email || !pw){ authError = t('auth.fillBoth'); render(); return; }
+    if(!EMAIL_RE.test(email)){ authError = t('auth.invalidEmail'); render(); return; }
+    if(!isLogin && pw.length < 8){ authError = t('auth.passwordTooShort'); render(); return; }
     if(isLogin) handleLogin(email, pw); else handleRegister(email, pw);
   });
   const onEnter = (e) => { if(e.key === 'Enter') submitBtn.click(); };
@@ -431,14 +502,14 @@ function renderAuthScreen(){
 
   if(isLogin){
     const forgot = el('div', {class:'auth-forgot'});
-    const forgotLink = el('a', {}, ['Passwort vergessen?']);
+    const forgotLink = el('a', {}, [t('auth.forgotPassword')]);
     forgotLink.addEventListener('click', () => handlePasswordReset(emailInput.value.trim()));
     forgot.appendChild(forgotLink);
     card.appendChild(forgot);
   }
 
   const switchRow = el('div', {class:'auth-switch'});
-  const switchLink = el('a', {}, [isLogin ? 'Noch keinen Account? Registrieren' : 'Schon einen Account? Anmelden']);
+  const switchLink = el('a', {}, [isLogin ? t('auth.switchToRegister') : t('auth.switchToLogin')]);
   switchLink.addEventListener('click', () => {
     authMode = isLogin ? 'register' : 'login';
     authError = ''; authInfo = '';
@@ -455,39 +526,42 @@ function renderMainView(){
   const wrap = el('div', {});
   const userBar = el('div', {class:'user-bar'});
   userBar.appendChild(el('span', {class:'user-email'}, [authUser.email || '']));
-  const logoutBtn = el('button', {class:'btn logout-btn'}, ['Abmelden']);
+  const logoutBtn = el('button', {class:'btn logout-btn'}, [t('main.logout')]);
   logoutBtn.addEventListener('click', handleLogout);
   userBar.appendChild(logoutBtn);
   wrap.appendChild(userBar);
-  wrap.appendChild(el('h1', {}, ['Trainingsplan']));
-  wrap.appendChild(el('div', {class:'sub'}, ['Tag antippen zum Bearbeiten, Start direkt am Tag.']));
+  wrap.appendChild(el('h1', {}, [t('main.title')]));
+  wrap.appendChild(el('div', {class:'sub'}, [t('main.subtitle')]));
 
   // Globale Einstellungen (einklappbar)
   const globalCard = el('div', {class:'card'});
   const globalHead = el('div', {class:'collapsible-head'});
   globalHead.appendChild(el('span', {class:`chevron ${state.globalExpanded?'open':''}`}, ['▸']));
-  globalHead.appendChild(el('span', {class:'collapsible-title'}, ['Globale Einstellungen']));
+  globalHead.appendChild(el('span', {class:'collapsible-title'}, [t('main.globalSettings')]));
   globalHead.addEventListener('click', () => { state.globalExpanded = !state.globalExpanded; render(); });
   globalCard.appendChild(globalHead);
 
   if(!state.globalExpanded){
     const p = state.plan;
     globalCard.appendChild(el('div', {class:'collapsible-summary'}, [
-      `Aufwärmen ${p.warmupSeconds}s · Satzpause ${p.setPauseSeconds}s · Übungspause ${p.pauseSeconds}s · Dehnen ${p.stretchSeconds}s · Sound ${p.soundOn ? 'an' : 'aus'}`
+      t('main.summary', {
+        warmup: p.warmupSeconds, setPause: p.setPauseSeconds, pause: p.pauseSeconds, stretch: p.stretchSeconds,
+        sound: p.soundOn ? t('main.soundOn') : t('main.soundOff')
+      })
     ]));
   } else {
     const body = el('div', {class:'collapsible-body'});
-    body.appendChild(makePlanNumberField('Aufwärmen (Sek.)', 'warmupSeconds', 0, 5));
-    body.appendChild(makePlanNumberField('Pause zwischen den Sätzen (Sek.)', 'setPauseSeconds', 0, 5));
-    body.appendChild(makePlanNumberField('Pause zwischen den Übungen (Sek.)', 'pauseSeconds', 0, 5));
-    body.appendChild(makePlanNumberField('Dehnen (Sek.)', 'stretchSeconds', 0, 5));
+    body.appendChild(makePlanNumberField(t('main.warmupLabel'), 'warmupSeconds', 0, 5));
+    body.appendChild(makePlanNumberField(t('main.setPauseLabel'), 'setPauseSeconds', 0, 5));
+    body.appendChild(makePlanNumberField(t('main.pauseLabel'), 'pauseSeconds', 0, 5));
+    body.appendChild(makePlanNumberField(t('main.stretchLabel'), 'stretchSeconds', 0, 5));
 
     const soundRow = el('div', {class:'sound-toggle', style:{marginTop:'12px'}});
     const checkbox = el('input', {type:'checkbox', id:'soundToggle'});
     checkbox.checked = state.plan.soundOn;
     checkbox.addEventListener('change', e => { state.plan.soundOn = e.target.checked; schedulePersist(); });
     soundRow.appendChild(checkbox);
-    soundRow.appendChild(el('label', {for:'soundToggle'}, ['Akustisches Feedback']));
+    soundRow.appendChild(el('label', {for:'soundToggle'}, [t('main.soundLabel')]));
     body.appendChild(soundRow);
     globalCard.appendChild(body);
   }
@@ -498,9 +572,9 @@ function renderMainView(){
     wrap.appendChild(renderDayCard(day, dayIdx));
   });
 
-  const addDayBtn = el('button', {class:'btn btn-block'}, ['+ Tag hinzufügen']);
+  const addDayBtn = el('button', {class:'btn btn-block'}, [t('main.addDay')]);
   addDayBtn.addEventListener('click', () => {
-    const newDay = { id: uid(), name: 'Neuer Tag', exercises: [] };
+    const newDay = { id: uid(), name: t('main.newDayName'), exercises: [] };
     state.plan.days.push(newDay);
     state.expandedDayIds.add(newDay.id);
     schedulePersist();
@@ -527,7 +601,7 @@ function makePlanNumberField(labelText, key, min, step){
     document.querySelectorAll('.day-total').forEach(elm => {
       const dayId = elm.getAttribute('data-day-id');
       const day = state.plan.days.find(d => d.id === dayId);
-      if(day) elm.textContent = `Gesamtdauer: ${formatMinSec(dayTotalSeconds(day))}`;
+      if(day) elm.textContent = t('day.totalDuration', {duration: formatMinSec(dayTotalSeconds(day))});
     });
   });
   field.appendChild(input);
@@ -550,7 +624,7 @@ function renderDayCard(day, dayIdx){
   nameInput.addEventListener('input', e => { day.name = e.target.value; schedulePersist(); });
   const delBtn = el('button', {class:'icon-btn'}, ['✕']);
   delBtn.addEventListener('click', () => {
-    if(confirm(`Tag "${day.name}" wirklich löschen?`)){
+    if(confirm(t('day.deleteConfirm', {name: day.name}))){
       state.expandedDayIds.delete(day.id);
       state.plan.days.splice(dayIdx,1);
       schedulePersist();
@@ -563,11 +637,11 @@ function renderDayCard(day, dayIdx){
   card.appendChild(head);
 
   const metaRow = el('div', {class:'day-meta-row'});
-  metaRow.appendChild(el('div', {class:'day-total', 'data-day-id': day.id}, [`Gesamtdauer: ${formatMinSec(dayTotalSeconds(day))}`]));
-  const startBtn = el('button', {class:'btn btn-primary day-start-btn'}, ['▶ Start']);
+  metaRow.appendChild(el('div', {class:'day-total', 'data-day-id': day.id}, [t('day.totalDuration', {duration: formatMinSec(dayTotalSeconds(day))})]));
+  const startBtn = el('button', {class:'btn btn-primary day-start-btn'}, [t('day.start')]);
   startBtn.addEventListener('click', () => {
     if(day.exercises.length > 0) startTimer(day);
-    else alert('Dieser Tag hat noch keine Übungen. Bitte erst hinzufügen.');
+    else alert(t('day.noExercisesAlert'));
   });
   metaRow.appendChild(startBtn);
   card.appendChild(metaRow);
@@ -575,14 +649,14 @@ function renderDayCard(day, dayIdx){
   if(isExpanded){
     const body = el('div', {class:'collapsible-body'});
     if(day.exercises.length === 0){
-      body.appendChild(el('div', {class:'empty-note'}, ['Noch keine Übungen — füge unten welche hinzu.']));
+      body.appendChild(el('div', {class:'empty-note'}, [t('day.noExercisesYet')]));
     }
     day.exercises.forEach((ex, exIdx) => {
       body.appendChild(renderExerciseRow(day, ex, exIdx));
     });
-    const addExBtn = el('button', {class:'btn add-ex-btn'}, ['+ Übung']);
+    const addExBtn = el('button', {class:'btn add-ex-btn'}, [t('day.addExercise')]);
     addExBtn.addEventListener('click', () => {
-      day.exercises.push({ id: uid(), name: '', muscle: MUSCLE_GROUPS[0], sets: 3, seconds: 30 });
+      day.exercises.push({ id: uid(), name: '', muscle: MUSCLE_GROUP_IDS[0], sets: 3, seconds: 30 });
       schedulePersist();
       render();
     });
@@ -595,13 +669,11 @@ function renderDayCard(day, dayIdx){
 
 function updateDayTotalDisplay(day){
   const elm = document.querySelector(`.day-total[data-day-id="${day.id}"]`);
-  if(elm) elm.textContent = `Gesamtdauer: ${formatMinSec(dayTotalSeconds(day))}`;
+  if(elm) elm.textContent = t('day.totalDuration', {duration: formatMinSec(dayTotalSeconds(day))});
 }
 
 function renderExerciseRow(day, ex, exIdx){
   const row = el('div', {class:'exercise-row'});
-
-  const line1 = el('div', {class:'ex-line1'});
 
   const reorderBox = el('div', {class:'reorder-box'});
   const upBtn = el('button', {class:'icon-btn reorder-btn'}, ['▲']);
@@ -623,14 +695,17 @@ function renderExerciseRow(day, ex, exIdx){
   reorderBox.appendChild(upBtn);
   reorderBox.appendChild(downBtn);
 
-  const nameInput = el('input', {type:'text', class:'ex-name', placeholder:'Übung (Freitext)'});
+  const content = el('div', {class:'ex-content'});
+  const line1 = el('div', {class:'ex-line1'});
+
+  const nameInput = el('input', {type:'text', class:'ex-name', placeholder: t('exercise.namePlaceholder')});
   nameInput.value = ex.name;
   nameInput.addEventListener('input', e => { ex.name = e.target.value; schedulePersist(); });
 
   const muscleSelect = el('select', {class:'ex-muscle'});
-  MUSCLE_GROUPS.forEach(m => {
-    const opt = el('option', {value:m}, [m]);
-    if(ex.muscle === m) opt.setAttribute('selected','selected');
+  MUSCLE_GROUP_IDS.forEach(id => {
+    const opt = el('option', {value:id}, [t('muscle.'+id)]);
+    if(ex.muscle === id) opt.setAttribute('selected','selected');
     muscleSelect.appendChild(opt);
   });
   muscleSelect.addEventListener('change', e => { ex.muscle = e.target.value; schedulePersist(); });
@@ -642,7 +717,6 @@ function renderExerciseRow(day, ex, exIdx){
     render();
   });
 
-  line1.appendChild(reorderBox);
   line1.appendChild(nameInput);
   line1.appendChild(muscleSelect);
   line1.appendChild(delBtn);
@@ -650,7 +724,7 @@ function renderExerciseRow(day, ex, exIdx){
   const line2 = el('div', {class:'ex-line2'});
 
   const setsField = el('div', {class:'field-mini'});
-  setsField.appendChild(el('label', {}, ['Sätze']));
+  setsField.appendChild(el('label', {}, [t('exercise.sets')]));
   const setsInput = el('input', {type:'number', min:'1'});
   setsInput.value = ex.sets;
   setsInput.addEventListener('input', e => {
@@ -661,7 +735,7 @@ function renderExerciseRow(day, ex, exIdx){
   setsField.appendChild(setsInput);
 
   const secField = el('div', {class:'field-mini'});
-  secField.appendChild(el('label', {}, ['Sek./Satz']));
+  secField.appendChild(el('label', {}, [t('exercise.secondsPerSet')]));
   const secInput = el('input', {type:'number', min:'5', step:'5'});
   secInput.value = ex.seconds;
   secInput.addEventListener('input', e => {
@@ -674,8 +748,11 @@ function renderExerciseRow(day, ex, exIdx){
   line2.appendChild(setsField);
   line2.appendChild(secField);
 
-  row.appendChild(line1);
-  row.appendChild(line2);
+  content.appendChild(line1);
+  content.appendChild(line2);
+
+  row.appendChild(reorderBox);
+  row.appendChild(content);
   return row;
 }
 
@@ -740,9 +817,9 @@ function finishTimer(){
   app.innerHTML = '';
   const wrap = el('div', {class:'finished'});
   wrap.appendChild(el('div', {class:'big'}, ['🏁']));
-  wrap.appendChild(el('h1', {}, ['Fertig!']));
-  wrap.appendChild(el('div', {class:'sub'}, [`${state.currentDayName} abgeschlossen.`]));
-  const backBtn = el('button', {class:'btn btn-primary btn-block'}, ['Zurück']);
+  wrap.appendChild(el('h1', {}, [t('finished.title')]));
+  wrap.appendChild(el('div', {class:'sub'}, [t('finished.subtitle', {day: state.currentDayName})]));
+  const backBtn = el('button', {class:'btn btn-primary btn-block'}, [t('finished.back')]);
   backBtn.addEventListener('click', () => { render(); });
   wrap.appendChild(backBtn);
   app.appendChild(wrap);
@@ -768,32 +845,32 @@ function renderTimerScreen(){
 
   if(s.mode === 'exercise'){
     primary = s.name;
-    secondary = `${s.muscle} · Satz ${s.setNum}/${s.totalSets}`;
+    secondary = t('timer.exerciseSecondary', {muscle: t('muscle.'+s.muscle), set: s.setNum, total: s.totalSets});
     if(s.setNum === s.totalSets){
       const nxt = peekNext(state.stepIndex);
-      if(nxt && nxt.type === 'exercise') hint = `Nächste Übung: ${nxt.name}`;
-      else if(nxt && nxt.type === 'stretch') hint = 'Danach: Dehnen';
+      if(nxt && nxt.type === 'exercise') hint = t('timer.nextExercise', {name: nxt.name});
+      else if(nxt && nxt.type === 'stretch') hint = t('timer.afterStretch');
     }
   } else if(s.mode === 'pause'){
-    primary = 'Pause';
+    primary = t('timer.pause');
     const nextStep = steps[state.stepIndex+1];
     if(nextStep && nextStep.mode === 'exercise'){
       secondary = (nextStep.setNum === 1)
-        ? `Nächste Übung: ${nextStep.name}`
-        : `Weiter: ${nextStep.name} · Satz ${nextStep.setNum}/${nextStep.totalSets}`;
+        ? t('timer.nextExercise', {name: nextStep.name})
+        : t('timer.continueWith', {name: nextStep.name, set: nextStep.setNum, total: nextStep.totalSets});
     } else if(nextStep && nextStep.mode === 'stretch'){
-      secondary = 'Gleich: Dehnen';
+      secondary = t('timer.soonStretch');
     }
   } else if(s.mode === 'warmup'){
-    primary = 'Aufwärmen';
+    primary = t('timer.warmup');
     const nextStep = steps[state.stepIndex+1];
-    if(nextStep && nextStep.mode === 'exercise') secondary = `Erste Übung: ${nextStep.name}`;
+    if(nextStep && nextStep.mode === 'exercise') secondary = t('timer.firstExercise', {name: nextStep.name});
   } else if(s.mode === 'stretch'){
-    primary = 'Dehnen';
-    secondary = 'Fast geschafft';
+    primary = t('timer.stretch');
+    secondary = t('timer.almostDone');
   }
 
-  wrap.appendChild(el('div', {class:'timer-meta'}, [`${state.currentDayName} · Schritt ${state.stepIndex+1} / ${steps.length}`]));
+  wrap.appendChild(el('div', {class:'timer-meta'}, [t('timer.stepMeta', {day: state.currentDayName, current: state.stepIndex+1, total: steps.length})]));
   wrap.appendChild(el('div', {class:`timer-primary ${isRestColor?'pause-mode':'exercise-mode'}`}, [primary]));
   if(secondary) wrap.appendChild(el('div', {class:'timer-secondary'}, [secondary]));
   if(hint) wrap.appendChild(el('div', {class:'timer-hint'}, [hint]));
@@ -820,17 +897,17 @@ function renderTimerScreen(){
     </div>
     <div class="overall-progress-text">
       <span id="overallElapsed">${formatClock(elapsed)}</span>
-      <span>Gesamt ${formatClock(stepsTotalSeconds)}</span>
+      <span>${t('timer.overallTotal', {duration: formatClock(stepsTotalSeconds)})}</span>
     </div>
   `;
   wrap.appendChild(overall);
 
   const controls = el('div', {class:'timer-controls'});
-  const pauseBtn = el('button', {class:'btn'}, [state.paused ? '▶ Weiter' : '⏸ Pause']);
+  const pauseBtn = el('button', {class:'btn'}, [state.paused ? t('timer.resumeBtn') : t('timer.pauseBtn')]);
   pauseBtn.addEventListener('click', togglePause);
-  const skipBtn = el('button', {class:'btn'}, ['⏭ Weiter']);
+  const skipBtn = el('button', {class:'btn'}, [t('timer.skipBtn')]);
   skipBtn.addEventListener('click', skipStep);
-  const cancelBtn = el('button', {class:'btn btn-danger'}, ['Abbrechen']);
+  const cancelBtn = el('button', {class:'btn btn-danger'}, [t('timer.cancelBtn')]);
   cancelBtn.addEventListener('click', stopTimer);
   controls.appendChild(pauseBtn);
   controls.appendChild(skipBtn);
@@ -860,19 +937,22 @@ function updateTimerDOM(){
 }
 
 /* ---------- Start ---------- */
-render();
-auth.onAuthStateChanged(user => {
-  authReady = true;
-  authError = '';
-  authInfo = '';
-  if(user){
-    authUser = user;
-    loadPlanForCurrentUser();
-  } else {
-    authUser = null;
-    state.plan = deepClone(DEFAULT_PLAN);
-    settings = { theme: null, language: null };
-    ensureIds();
-    render();
-  }
-});
+(async function bootstrap(){
+  await loadLanguage(detectInitialLanguage());
+  render();
+  auth.onAuthStateChanged(user => {
+    authReady = true;
+    authError = '';
+    authInfo = '';
+    if(user){
+      authUser = user;
+      loadPlanForCurrentUser();
+    } else {
+      authUser = null;
+      state.plan = deepClone(DEFAULT_PLAN);
+      settings = { theme: null, language: null };
+      ensureIds();
+      render();
+    }
+  });
+})();

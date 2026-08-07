@@ -102,7 +102,10 @@ async function handlePasswordReset(email){
 /* ---------- Daten ---------- */
 const MUSCLE_GROUPS = ["Brust","Rücken","Schultern","Bizeps","Trizeps","Beine","Bauch","Ganzkörper","Cardio","Sonstiges"];
 
+const CURRENT_PLAN_SCHEMA_VERSION = 1;
+
 const DEFAULT_PLAN = {
+  schemaVersion: CURRENT_PLAN_SCHEMA_VERSION,
   warmupSeconds: 60,
   setPauseSeconds: 60,
   pauseSeconds: 15,
@@ -153,6 +156,15 @@ function ensureIds(){
   });
 }
 
+// Bringt einen aus Firestore geladenen Plan (ggf. altes Schema) auf CURRENT_PLAN_SCHEMA_VERSION.
+// Jede künftige Schema-Aenderung bekommt hier einen eigenen "if(version < X)"-Migrationsschritt.
+function migratePlan(plan){
+  let version = plan.schemaVersion || 1;
+  // if(version < 2){ ... plan = ...; version = 2; }
+  plan.schemaVersion = CURRENT_PLAN_SCHEMA_VERSION;
+  return plan;
+}
+
 /* ---------- Speicher (Firestore pro Benutzer, mit lokalem Cache als Fallback) ---------- */
 let saveTimeout = null;
 
@@ -176,7 +188,7 @@ async function persistPlan(){
     await userDocRef().set({
       plan: state.plan,
       updatedAt: firebase.firestore.FieldValue.serverTimestamp()
-    });
+    }, { merge: true });
     const key = localCacheKey();
     if(key){ try{ localStorage.setItem(key, JSON.stringify(state.plan)); }catch(e){} }
     showSaveStatus(true);
@@ -200,7 +212,7 @@ async function loadPlanForCurrentUser(){
   try{
     const doc = await userDocRef().get();
     if(doc.exists && doc.data() && doc.data().plan){
-      state.plan = doc.data().plan;
+      state.plan = migratePlan(doc.data().plan);
     } else {
       state.plan = deepClone(DEFAULT_PLAN);
       ensureIds();
@@ -210,7 +222,7 @@ async function loadPlanForCurrentUser(){
     if(key){
       try{
         const raw = localStorage.getItem(key);
-        state.plan = raw ? JSON.parse(raw) : deepClone(DEFAULT_PLAN);
+        state.plan = raw ? migratePlan(JSON.parse(raw)) : deepClone(DEFAULT_PLAN);
       }catch(e2){ state.plan = deepClone(DEFAULT_PLAN); }
     } else {
       state.plan = deepClone(DEFAULT_PLAN);

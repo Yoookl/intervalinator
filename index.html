@@ -87,8 +87,8 @@
     padding:4px 8px;border-radius:6px;line-height:1;
   }
   .icon-btn:hover{color:var(--danger);}
-  .reorder-box{display:flex;flex-direction:column;gap:2px;}
-  .reorder-btn{font-size:11px;padding:2px 6px;color:var(--text-dim);}
+  .reorder-box{display:flex;flex-direction:column;gap:4px;}
+  .reorder-btn{font-size:18px;padding:8px 14px;min-width:40px;min-height:38px;color:var(--text-dim);}
   .reorder-btn:hover{color:var(--amber);}
   .reorder-btn:disabled{opacity:0.25;cursor:default;}
   .reorder-btn:disabled:hover{color:var(--text-dim);}
@@ -197,6 +197,7 @@
   .auth-field{margin-bottom:12px;}
   .auth-field label{display:block;font-size:12px;color:var(--text-dim);margin-bottom:5px;text-transform:uppercase;letter-spacing:0.4px;}
   .auth-field input{width:100%;padding:11px 12px;font-size:16px;}
+  .auth-hint{font-size:11px;color:var(--text-dim);margin-top:5px;}
   .auth-error{background:#3a1a1a;border:1px solid var(--danger);color:#ffb4a8;padding:10px 12px;border-radius:8px;font-size:12px;margin-bottom:12px;}
   .auth-info{background:#1a2f3a;border:1px solid var(--steel);color:#b8d8ee;padding:10px 12px;border-radius:8px;font-size:12px;margin-bottom:12px;}
   .auth-switch{text-align:center;font-size:13px;color:var(--text-dim);margin-top:14px;}
@@ -265,6 +266,7 @@ let authMode = 'login'; // 'login' | 'register'
 let authError = '';
 let authInfo = '';
 let authBusy = false;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 function translateAuthError(e){
   const map = {
@@ -468,23 +470,27 @@ function beep(freq, durationMs, gain){
 function beepForMode(mode){
   const restLike = (mode === 'pause' || mode === 'stretch');
   if(restLike){
-    beep(392, 220, 0.4);
-    setTimeout(() => beep(294, 320, 0.4), 200);
+    beep(392, 260, 0.6);
+    setTimeout(() => beep(294, 360, 0.6), 220);
   } else {
-    beep(880, 180, 0.45);
-    setTimeout(() => beep(1175, 280, 0.45), 170);
+    beep(880, 200, 0.65);
+    setTimeout(() => beep(1175, 320, 0.65), 180);
   }
-  if(navigator.vibrate) navigator.vibrate(restLike ? [140] : [90,60,90]);
+  if(navigator.vibrate) navigator.vibrate(restLike ? [180] : [110,70,110]);
+}
+function tenSecondWarning(){
+  beep(587, 200, 0.5);
+  if(navigator.vibrate) navigator.vibrate(90);
 }
 function countdownBeep(remaining){
   const freq = 700 + (5 - remaining) * 160;
-  beep(freq, 160, 0.5);
-  if(navigator.vibrate) navigator.vibrate(70);
+  beep(freq, 170, 0.65);
+  if(navigator.vibrate) navigator.vibrate(90);
 }
 function finishFanfare(){
-  beep(659, 200, 0.5);
-  setTimeout(() => beep(784, 200, 0.5), 200);
-  setTimeout(() => beep(1046, 550, 0.5), 400);
+  beep(659, 200, 0.6);
+  setTimeout(() => beep(784, 200, 0.6), 200);
+  setTimeout(() => beep(1046, 550, 0.6), 400);
   if(navigator.vibrate) navigator.vibrate([120,80,120,80,200]);
 }
 
@@ -584,6 +590,7 @@ function renderAuthScreen(){
   pwField.appendChild(el('label', {}, ['Passwort']));
   const pwInput = el('input', {type:'password', autocomplete: isLogin ? 'current-password' : 'new-password'});
   pwField.appendChild(pwInput);
+  if(!isLogin) pwField.appendChild(el('div', {class:'auth-hint'}, ['Mindestens 8 Zeichen']));
 
   card.appendChild(emailField);
   card.appendChild(pwField);
@@ -594,6 +601,8 @@ function renderAuthScreen(){
     const email = emailInput.value.trim();
     const pw = pwInput.value;
     if(!email || !pw){ authError = 'Bitte E-Mail und Passwort eingeben.'; render(); return; }
+    if(!EMAIL_RE.test(email)){ authError = 'Bitte eine gültige E-Mail-Adresse eingeben.'; render(); return; }
+    if(!isLogin && pw.length < 8){ authError = 'Das Passwort muss mindestens 8 Zeichen lang sein.'; render(); return; }
     if(isLogin) handleLogin(email, pw); else handleRegister(email, pw);
   });
   const onEnter = (e) => { if(e.key === 'Enter') submitBtn.click(); };
@@ -879,6 +888,7 @@ function tick(){
   if(state.remaining <= 0){
     advanceStep();
   } else {
+    if(state.remaining === 10) tenSecondWarning();
     if(state.remaining <= 5) countdownBeep(state.remaining);
     updateTimerDOM();
   }

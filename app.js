@@ -155,6 +155,44 @@ async function handlePasswordReset(email){
   render();
 }
 
+/* ---------- Profil (Passwort aendern, Account loeschen) ---------- */
+let profileError = '';
+let profileInfo = '';
+
+async function handleChangePassword(currentPw, newPw){
+  profileError = ''; profileInfo = '';
+  if(!currentPw || !newPw){ profileError = t('auth.fillBoth'); render(); return; }
+  if(newPw.length < 8){ profileError = t('auth.passwordTooShort'); render(); return; }
+  try{
+    const cred = firebase.auth.EmailAuthProvider.credential(authUser.email, currentPw);
+    await authUser.reauthenticateWithCredential(cred);
+    await authUser.updatePassword(newPw);
+    profileInfo = t('profile.passwordChanged');
+  }catch(e){
+    profileError = translateAuthError(e);
+  }
+  render();
+}
+
+async function handleDeleteAccount(password){
+  profileError = '';
+  try{
+    const cred = firebase.auth.EmailAuthProvider.credential(authUser.email, password);
+    await authUser.reauthenticateWithCredential(cred);
+    const uid = authUser.uid;
+    const batch = db.batch();
+    const sessionsSnap = await db.collection('users').doc(uid).collection('sessions').get();
+    sessionsSnap.forEach(doc => batch.delete(doc.ref));
+    batch.delete(db.collection('users').doc(uid));
+    await batch.commit();
+    await authUser.delete();
+    // auth.onAuthStateChanged uebernimmt danach das Zuruecksetzen von state/settings.
+  }catch(e){
+    profileError = translateAuthError(e);
+    render();
+  }
+}
+
 /* ---------- Daten ---------- */
 const MUSCLE_GROUP_IDS = ["chest","back","shoulders","biceps","triceps","legs","abs","fullbody","cardio","other"];
 // Migriert alte, direkt als deutscher Anzeigetext gespeicherte Muskelgruppen-Werte (Schema v1) auf stabile IDs.
@@ -213,6 +251,7 @@ const DEFAULT_PLAN = {
 
 const state = {
   plan: deepClone(DEFAULT_PLAN),
+  screen: 'main', // 'main' | 'profile'
   expandedDayIds: new Set(),
   running: false,
   stepIndex: 0,
@@ -592,6 +631,10 @@ function render(){
     app.appendChild(renderTimerScreen());
     return;
   }
+  if(state.screen === 'profile'){
+    app.appendChild(renderProfileScreen());
+    return;
+  }
   app.appendChild(renderMainView());
 }
 
@@ -663,13 +706,136 @@ function renderAuthScreen(){
   return wrap;
 }
 
+const LANGUAGE_NAMES = { de: 'Deutsch', en: 'English', fr: 'Français', es: 'Español' };
+
+function openDeleteAccountModal(){
+  openModal((close) => {
+    const wrap = el('div', {});
+    wrap.appendChild(el('div', {class:'modal-title'}, [t('profile.deleteModalTitle')]));
+    wrap.appendChild(el('div', {class:'sub'}, [t('profile.deleteAccountWarning')]));
+
+    const pwField = el('div', {class:'auth-field'});
+    pwField.appendChild(el('label', {}, [t('profile.deleteModalPasswordLabel')]));
+    const pwInput = el('input', {type:'password'});
+    pwField.appendChild(pwInput);
+    wrap.appendChild(pwField);
+
+    const actions = el('div', {class:'modal-actions'});
+    const cancelBtn = el('button', {class:'btn'}, [t('common.cancel')]);
+    cancelBtn.addEventListener('click', close);
+    const confirmBtn = el('button', {class:'btn btn-danger'}, [t('profile.deleteModalConfirmButton')]);
+    confirmBtn.addEventListener('click', () => {
+      const pw = pwInput.value;
+      close();
+      handleDeleteAccount(pw);
+    });
+    actions.appendChild(cancelBtn);
+    actions.appendChild(confirmBtn);
+    wrap.appendChild(actions);
+
+    return wrap;
+  });
+}
+
+function renderProfileScreen(){
+  const wrap = el('div', {});
+
+  const head = el('div', {class:'user-bar'});
+  const backBtn = el('button', {class:'btn logout-btn'}, ['← ' + t('profile.back')]);
+  backBtn.addEventListener('click', () => { state.screen = 'main'; render(); });
+  head.appendChild(backBtn);
+  wrap.appendChild(head);
+
+  wrap.appendChild(el('h1', {}, [t('profile.title')]));
+  wrap.appendChild(el('div', {class:'sub'}, [authUser.email || '']));
+
+  if(profileError) wrap.appendChild(el('div', {class:'auth-error'}, [profileError]));
+  if(profileInfo) wrap.appendChild(el('div', {class:'auth-info'}, [profileInfo]));
+
+  // Darstellung: Theme + Sprache
+  const appearanceCard = el('div', {class:'card'});
+  appearanceCard.appendChild(el('div', {class:'card-title'}, [t('profile.appearance')]));
+
+  const themeField = el('div', {class:'field'});
+  themeField.appendChild(el('label', {}, [t('profile.appearance')]));
+  const themeSelect = el('select', {});
+  const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
+  ['dark','light'].forEach(th => {
+    const opt = el('option', {value:th}, [t(th === 'dark' ? 'profile.themeDark' : 'profile.themeLight')]);
+    if(th === currentTheme) opt.setAttribute('selected','selected');
+    themeSelect.appendChild(opt);
+  });
+  themeSelect.addEventListener('change', e => {
+    applyTheme(e.target.value);
+    settings.theme = e.target.value;
+    scheduleSettingsPersist();
+  });
+  themeField.appendChild(themeSelect);
+  appearanceCard.appendChild(themeField);
+
+  const langField = el('div', {class:'field'});
+  langField.appendChild(el('label', {}, [t('profile.language')]));
+  const langSelect = el('select', {});
+  SUPPORTED_LANGUAGES.forEach(lang => {
+    const opt = el('option', {value:lang}, [LANGUAGE_NAMES[lang]]);
+    if(lang === currentLanguage) opt.setAttribute('selected','selected');
+    langSelect.appendChild(opt);
+  });
+  langSelect.addEventListener('change', e => { setLanguage(e.target.value); });
+  langField.appendChild(langSelect);
+  appearanceCard.appendChild(langField);
+
+  wrap.appendChild(appearanceCard);
+
+  // Passwort aendern
+  const pwCard = el('div', {class:'card'});
+  pwCard.appendChild(el('div', {class:'card-title'}, [t('profile.changePasswordTitle')]));
+
+  const curPwField = el('div', {class:'auth-field'});
+  curPwField.appendChild(el('label', {}, [t('profile.currentPassword')]));
+  const curPwInput = el('input', {type:'password', autocomplete:'current-password'});
+  curPwField.appendChild(curPwInput);
+  pwCard.appendChild(curPwField);
+
+  const newPwField = el('div', {class:'auth-field'});
+  newPwField.appendChild(el('label', {}, [t('profile.newPassword')]));
+  const newPwInput = el('input', {type:'password', autocomplete:'new-password'});
+  newPwField.appendChild(newPwInput);
+  newPwField.appendChild(el('div', {class:'auth-hint'}, [t('auth.passwordHint')]));
+  pwCard.appendChild(newPwField);
+
+  const changePwBtn = el('button', {class:'btn btn-block'}, [t('profile.changePasswordButton')]);
+  changePwBtn.addEventListener('click', () => {
+    handleChangePassword(curPwInput.value, newPwInput.value);
+  });
+  pwCard.appendChild(changePwBtn);
+
+  wrap.appendChild(pwCard);
+
+  // Gefahrenzone: Account loeschen
+  const dangerCard = el('div', {class:'card'});
+  dangerCard.appendChild(el('div', {class:'card-title'}, [t('profile.dangerZone')]));
+  dangerCard.appendChild(el('div', {class:'sub'}, [t('profile.deleteAccountWarning')]));
+  const deleteBtn = el('button', {class:'btn btn-danger btn-block'}, [t('profile.deleteAccountButton')]);
+  deleteBtn.addEventListener('click', () => openDeleteAccountModal());
+  dangerCard.appendChild(deleteBtn);
+  wrap.appendChild(dangerCard);
+
+  return wrap;
+}
+
 function renderMainView(){
   const wrap = el('div', {});
   const userBar = el('div', {class:'user-bar'});
   userBar.appendChild(el('span', {class:'user-email'}, [authUser.email || '']));
+  const userBarBtns = el('div', {class:'user-bar-btns'});
+  const settingsBtn = el('button', {class:'btn logout-btn'}, ['⚙']);
+  settingsBtn.addEventListener('click', () => { state.screen = 'profile'; render(); });
+  userBarBtns.appendChild(settingsBtn);
   const logoutBtn = el('button', {class:'btn logout-btn'}, [t('main.logout')]);
   logoutBtn.addEventListener('click', handleLogout);
-  userBar.appendChild(logoutBtn);
+  userBarBtns.appendChild(logoutBtn);
+  userBar.appendChild(userBarBtns);
   wrap.appendChild(userBar);
   wrap.appendChild(el('h1', {}, [t('main.title')]));
   wrap.appendChild(el('div', {class:'sub'}, [t('main.subtitle')]));
@@ -1121,6 +1287,7 @@ function updateTimerDOM(){
     } else {
       authUser = null;
       state.plan = deepClone(DEFAULT_PLAN);
+      state.screen = 'main';
       settings = { theme: null, language: null };
       ensureIds();
       render();

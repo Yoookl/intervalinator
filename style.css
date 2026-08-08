@@ -263,3 +263,13 @@ select{
 .special-label{font-weight:700;font-size:14px;flex:1;}
 .pause-trigger{cursor:pointer;}
 .pause-value{font-size:13px;font-weight:600;color:var(--text);}
+
+/* Onboarding */
+.checkbox-list{display:flex;flex-direction:column;gap:8px;}
+.checkbox-list-item{display:flex;align-items:center;gap:10px;font-size:14px;cursor:pointer;}
+.checkbox-list-item input{width:18px;height:18px;flex-shrink:0;}
+.onboarding-card{border-color:var(--amber);}
+.onboarding-card-actions{display:flex;gap:10px;margin-top:12px;}
+.onboarding-card-actions .btn{flex:1;}
+.profile-link-row{text-align:center;margin-top:4px;}
+.profile-link-row a{color:var(--amber);cursor:pointer;text-decoration:underline;font-size:13px;}

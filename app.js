@@ -371,6 +371,29 @@ async function persistSettings(){
   }catch(e){ /* Einstellungen sind sekundaer, kein User-Feedback noetig */ }
 }
 
+/* ---------- Onboarding (Trainingsziele) ---------- */
+const EQUIPMENT_IDS = ["dumbbells","barbell","resistance_bands","pullup_bar","bench","kettlebell","machines","bodyweight_only","cardio_equipment"];
+const FOCUS_IDS = ["strength","hypertrophy","endurance","weight_loss","mobility","general_fitness"];
+
+let onboarding = { equipment: [], focus: [], constraints: '', hoursPerWeek: null, completed: false };
+let onboardingCardDismissed = false;
+let onboardingSaveTimeout = null;
+
+function scheduleOnboardingPersist(){
+  if(!authUser) return;
+  clearTimeout(onboardingSaveTimeout);
+  onboardingSaveTimeout = setTimeout(persistOnboarding, 400);
+}
+
+async function persistOnboarding(){
+  if(!authUser) return;
+  try{
+    await userDocRef().set({
+      onboarding: { ...onboarding, updatedAt: firebase.firestore.FieldValue.serverTimestamp() }
+    }, { merge: true });
+  }catch(e){ /* Onboarding-Daten sind sekundaer, kein User-Feedback noetig */ }
+}
+
 async function loadPlanForCurrentUser(){
   const key = localCacheKey();
   try{
@@ -390,6 +413,12 @@ async function loadPlanForCurrentUser(){
       }
       if(settings.theme) applyTheme(settings.theme);
     }
+    if(data && data.onboarding){
+      onboarding = Object.assign({ equipment: [], focus: [], constraints: '', hoursPerWeek: null, completed: false }, data.onboarding);
+    } else {
+      onboarding = { equipment: [], focus: [], constraints: '', hoursPerWeek: null, completed: false };
+    }
+    onboardingCardDismissed = false;
   }catch(e){
     if(key){
       try{
@@ -635,6 +664,10 @@ function render(){
     app.appendChild(renderProfileScreen());
     return;
   }
+  if(state.screen === 'onboarding'){
+    app.appendChild(renderOnboardingScreen());
+    return;
+  }
   app.appendChild(renderMainView());
 }
 
@@ -787,6 +820,12 @@ function renderProfileScreen(){
 
   wrap.appendChild(appearanceCard);
 
+  const onboardingLinkRow = el('div', {class:'profile-link-row'});
+  const onboardingLink = el('a', {}, [t('onboarding.editLink')]);
+  onboardingLink.addEventListener('click', () => { state.screen = 'onboarding'; render(); });
+  onboardingLinkRow.appendChild(onboardingLink);
+  wrap.appendChild(onboardingLinkRow);
+
   // Passwort aendern
   const pwCard = el('div', {class:'card'});
   pwCard.appendChild(el('div', {class:'card-title'}, [t('profile.changePasswordTitle')]));
@@ -824,6 +863,82 @@ function renderProfileScreen(){
   return wrap;
 }
 
+function buildCheckboxList(idList, translationPrefix, selectedArray, onChange){
+  const wrap = el('div', {class:'checkbox-list'});
+  idList.forEach(id => {
+    const row = el('label', {class:'checkbox-list-item'});
+    const checkbox = el('input', {type:'checkbox'});
+    checkbox.checked = selectedArray.includes(id);
+    checkbox.addEventListener('change', () => {
+      const idx = selectedArray.indexOf(id);
+      if(checkbox.checked && idx === -1) selectedArray.push(id);
+      else if(!checkbox.checked && idx !== -1) selectedArray.splice(idx, 1);
+      onChange();
+    });
+    row.appendChild(checkbox);
+    row.appendChild(el('span', {}, [t(translationPrefix + id)]));
+    wrap.appendChild(row);
+  });
+  return wrap;
+}
+
+function renderOnboardingScreen(){
+  const wrap = el('div', {});
+
+  const head = el('div', {class:'user-bar'});
+  const backBtn = el('button', {class:'btn logout-btn'}, ['← ' + t('onboarding.back')]);
+  backBtn.addEventListener('click', () => { state.screen = 'main'; render(); });
+  head.appendChild(backBtn);
+  wrap.appendChild(head);
+
+  wrap.appendChild(el('h1', {}, [t('onboarding.title')]));
+  wrap.appendChild(el('div', {class:'sub'}, [t('onboarding.intro')]));
+
+  const card = el('div', {class:'card'});
+
+  card.appendChild(el('div', {class:'card-title'}, [t('onboarding.equipment')]));
+  card.appendChild(buildCheckboxList(EQUIPMENT_IDS, 'equipment.', onboarding.equipment, () => scheduleOnboardingPersist()));
+
+  card.appendChild(el('div', {class:'card-title', style:{marginTop:'16px'}}, [t('onboarding.focus')]));
+  card.appendChild(buildCheckboxList(FOCUS_IDS, 'focus.', onboarding.focus, () => scheduleOnboardingPersist()));
+
+  const hoursField = el('div', {class:'field', style:{marginTop:'16px'}});
+  hoursField.appendChild(el('label', {}, [t('onboarding.hoursPerWeek')]));
+  const hoursInput = el('input', {type:'number', min:'0', step:'0.5'});
+  hoursInput.value = onboarding.hoursPerWeek != null ? onboarding.hoursPerWeek : '';
+  hoursInput.addEventListener('input', e => {
+    const v = parseFloat(e.target.value);
+    onboarding.hoursPerWeek = isNaN(v) ? null : v;
+    scheduleOnboardingPersist();
+  });
+  hoursField.appendChild(hoursInput);
+  card.appendChild(hoursField);
+
+  const constraintsField = el('div', {class:'auth-field', style:{marginTop:'12px'}});
+  constraintsField.appendChild(el('label', {}, [t('onboarding.constraints')]));
+  const constraintsInput = el('input', {type:'text', placeholder: t('onboarding.constraintsPlaceholder')});
+  constraintsInput.value = onboarding.constraints || '';
+  constraintsInput.addEventListener('input', e => {
+    onboarding.constraints = e.target.value;
+    scheduleOnboardingPersist();
+  });
+  constraintsField.appendChild(constraintsInput);
+  card.appendChild(constraintsField);
+
+  wrap.appendChild(card);
+
+  const saveBtn = el('button', {class:'btn btn-primary btn-block'}, [t('onboarding.save')]);
+  saveBtn.addEventListener('click', () => {
+    onboarding.completed = true;
+    persistOnboarding();
+    state.screen = 'main';
+    render();
+  });
+  wrap.appendChild(saveBtn);
+
+  return wrap;
+}
+
 function renderMainView(){
   const wrap = el('div', {});
   const userBar = el('div', {class:'user-bar'});
@@ -839,6 +954,21 @@ function renderMainView(){
   wrap.appendChild(userBar);
   wrap.appendChild(el('h1', {}, [t('main.title')]));
   wrap.appendChild(el('div', {class:'sub'}, [t('main.subtitle')]));
+
+  if(!onboarding.completed && !onboardingCardDismissed){
+    const obCard = el('div', {class:'card onboarding-card'});
+    obCard.appendChild(el('div', {class:'card-title'}, [t('onboarding.dismissCardTitle')]));
+    obCard.appendChild(el('div', {class:'sub', style:{margin:'0'}}, [t('onboarding.dismissCardText')]));
+    const obActions = el('div', {class:'onboarding-card-actions'});
+    const dismissBtn = el('button', {class:'btn'}, ['✕']);
+    dismissBtn.addEventListener('click', () => { onboardingCardDismissed = true; render(); });
+    const fillBtn = el('button', {class:'btn btn-primary'}, [t('onboarding.dismissCardButton')]);
+    fillBtn.addEventListener('click', () => { state.screen = 'onboarding'; render(); });
+    obActions.appendChild(dismissBtn);
+    obActions.appendChild(fillBtn);
+    obCard.appendChild(obActions);
+    wrap.appendChild(obCard);
+  }
 
   const soundRow = el('div', {class:'sound-toggle', style:{marginBottom:'16px'}});
   const soundCheckbox = el('input', {type:'checkbox', id:'soundToggle'});
@@ -1289,6 +1419,8 @@ function updateTimerDOM(){
       state.plan = deepClone(DEFAULT_PLAN);
       state.screen = 'main';
       settings = { theme: null, language: null };
+      onboarding = { equipment: [], focus: [], constraints: '', hoursPerWeek: null, completed: false };
+      onboardingCardDismissed = false;
       ensureIds();
       render();
     }

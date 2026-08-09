@@ -634,6 +634,7 @@ function beep(freq, durationMs, gain){
   try{
     ensureAudio();
     if(!audioCtx) return;
+    if(audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
     const vol = (gain != null) ? gain : 0.16;
     const osc = audioCtx.createOscillator();
     const g = audioCtx.createGain();
@@ -647,6 +648,11 @@ function beep(freq, durationMs, gain){
   }catch(e){ /* Ton nicht verfügbar, ignorieren */ }
 }
 function beepForMode(mode){
+  if(mode === 'prepare'){
+    beep(523, 200, 0.5);
+    if(navigator.vibrate) navigator.vibrate(100);
+    return;
+  }
   const restLike = (mode === 'pause');
   if(restLike){
     beep(392, 260, 0.6);
@@ -672,6 +678,27 @@ function finishFanfare(){
   setTimeout(() => beep(1046, 550, 0.6), 400);
   if(navigator.vibrate) navigator.vibrate([120,80,120,80,200]);
 }
+
+/* ---------- Wake Lock (Bildschirm nicht sperren waehrend Training laeuft) ---------- */
+let wakeLockSentinel = null;
+async function requestWakeLock(){
+  if(!('wakeLock' in navigator)) return;
+  try{
+    wakeLockSentinel = await navigator.wakeLock.request('screen');
+    wakeLockSentinel.addEventListener('release', () => { wakeLockSentinel = null; });
+  }catch(e){ /* z.B. Tab im Hintergrund oder nicht unterstuetzt, ignorieren */ }
+}
+function releaseWakeLock(){
+  if(wakeLockSentinel){
+    wakeLockSentinel.release().catch(() => {});
+    wakeLockSentinel = null;
+  }
+}
+document.addEventListener('visibilitychange', () => {
+  if(document.visibilityState !== 'visible') return;
+  if(audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+  if(state.running && !wakeLockSentinel) requestWakeLock();
+});
 
 /* ---------- Trainings-Sequenz ---------- */
 let steps = [];
@@ -1476,11 +1503,13 @@ function renderExerciseRow(day, ex, exIdx){
 
 /* ---------- Timer-Ablauf ---------- */
 let sessionStartStamp = null;
+const PREPARE_SECONDS = 10;
 
 function startTimer(day){
   ensureAudio();
   steps = buildSteps(day);
   if(steps.length === 0) return;
+  steps.unshift({ mode:'prepare', seconds: PREPARE_SECONDS });
   computeStepOffsets();
   state.running = true;
   state.stepIndex = 0;
@@ -1489,6 +1518,7 @@ function startTimer(day){
   state.currentDayName = day.name;
   sessionStartStamp = new Date();
 
+  requestWakeLock();
   beepForMode(steps[0].mode);
 
   clearInterval(state.intervalId);
@@ -1569,12 +1599,14 @@ function stopTimer(){
   logSession(computeSessionSummary(false));
   clearInterval(state.intervalId);
   state.running = false;
+  releaseWakeLock();
   render();
 }
 function finishTimer(){
   logSession(computeSessionSummary(true));
   clearInterval(state.intervalId);
   state.running = false;
+  releaseWakeLock();
   finishFanfare();
   const app = document.getElementById('app');
   app.innerHTML = '';
@@ -1598,14 +1630,18 @@ function peekNext(fromIndex){
 
 function renderTimerScreen(){
   const s = steps[state.stepIndex];
-  const isRestColor = (s.mode === 'pause');
+  const isRestColor = (s.mode === 'pause' || s.mode === 'prepare');
   const wrap = el('div', {class:'wrap timer-screen'});
 
   let primary = '';
   let secondary = '';
   let hint = '';
 
-  if(s.mode === 'exercise'){
+  if(s.mode === 'prepare'){
+    primary = t('timer.prepare');
+    const nxt = peekNext(state.stepIndex);
+    if(nxt && nxt.type === 'exercise') secondary = t('timer.firstExercise', {name: nxt.name});
+  } else if(s.mode === 'exercise'){
     primary = s.name;
     secondary = t('timer.exerciseSecondary', {muscle: t('muscle.'+s.muscle), set: s.setNum, total: s.totalSets});
     if(s.setNum === s.totalSets){
@@ -1629,11 +1665,12 @@ function renderTimerScreen(){
 
   const ringWrap = el('div', {class:'ring-wrap'});
   const circumference = 2*Math.PI*108;
+  const ringFrac = Math.max(0, state.remaining) / s.seconds;
   ringWrap.innerHTML = `
     <svg width="240" height="240" viewBox="0 0 240 240">
       <circle class="ring-bg" cx="120" cy="120" r="108"></circle>
       <circle class="ring-fg ${isRestColor?'pause-mode':''}" id="ringFg" cx="120" cy="120" r="108"
-        stroke-dasharray="${circumference}" stroke-dashoffset="0"></circle>
+        stroke-dasharray="${circumference}" stroke-dashoffset="${circumference * (1 - ringFrac)}"></circle>
     </svg>
     <div class="ring-center">
       <div class="ring-time" id="ringTime">${state.remaining}</div>

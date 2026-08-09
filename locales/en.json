@@ -162,6 +162,7 @@
   "history.empty": "No completed workouts in the last 30 days yet.",
   "history.countBadge": "{count}×",
 
+  "timer.prepare": "Get ready...",
   "timer.pause": "Rest",
   "timer.warmup": "Warmup",
   "timer.stretch": "Stretch",

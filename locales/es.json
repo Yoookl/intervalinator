@@ -162,6 +162,7 @@
   "history.empty": "Todavía no hay entrenamientos completados en los últimos 30 días.",
   "history.countBadge": "{count}×",
 
+  "timer.prepare": "Prepárate...",
   "timer.pause": "Descanso",
   "timer.warmup": "Calentamiento",
   "timer.stretch": "Estiramiento",

@@ -259,8 +259,6 @@ select{
 .modal-actions .btn{flex:1;}
 
 /* Aufwaermen/Dehnen als kompakte Sonderzeilen */
-.special-row{border-left-color:var(--amber);}
-.special-label{font-weight:700;font-size:14px;flex:1;}
 .pause-trigger{cursor:pointer;}
 .pause-value{font-size:13px;font-weight:600;color:var(--text);}
 

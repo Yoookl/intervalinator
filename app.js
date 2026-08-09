@@ -194,59 +194,38 @@ async function handleDeleteAccount(password){
 }
 
 /* ---------- Daten ---------- */
-const MUSCLE_GROUP_IDS = ["chest","back","shoulders","biceps","triceps","legs","abs","fullbody","cardio","other"];
+const MUSCLE_GROUP_IDS = ["warmup","chest","back","shoulders","biceps","triceps","legs","abs","fullbody","cardio","stretch","other"];
 // Migriert alte, direkt als deutscher Anzeigetext gespeicherte Muskelgruppen-Werte (Schema v1) auf stabile IDs.
 const LEGACY_MUSCLE_MAP = {
   "Brust":"chest", "Rücken":"back", "Schultern":"shoulders", "Bizeps":"biceps", "Trizeps":"triceps",
   "Beine":"legs", "Bauch":"abs", "Ganzkörper":"fullbody", "Cardio":"cardio", "Sonstiges":"other"
 };
 
-const CURRENT_PLAN_SCHEMA_VERSION = 3;
+const CURRENT_PLAN_SCHEMA_VERSION = 5;
+const DEFAULT_WARMUP_SECONDS = 60;
+const DEFAULT_STRETCH_SECONDS = 120;
 
 function makeExercise(name, muscle, sets, seconds){
-  return { name, muscle, sets, seconds, type:'exercise', pauseAfterOverride:null, setPauseOverride:null };
+  return { name, muscle, sets, seconds, pauseAfterOverride:null, setPauseOverride:null };
 }
-function makeWarmup(seconds){
-  return { name:'', muscle:null, sets:1, seconds, type:'warmup', pauseAfterOverride:null, setPauseOverride:null };
-}
-function makeStretch(seconds){
-  return { name:'', muscle:null, sets:1, seconds, type:'stretch', pauseAfterOverride:null, setPauseOverride:null };
+// Aufwaermen/Dehnen sind bewusst ganz normale Uebungen (kein Sonderfall) -
+// vorbelegt mit 1 Satz und 60/120 Sek., aber genauso frei editier-/loesch-/verschiebbar wie jede andere.
+function makeDay(name, exercises){
+  return { name, exercises: [
+    makeExercise("Aufwärmen", "warmup", 1, DEFAULT_WARMUP_SECONDS),
+    ...exercises,
+    makeExercise("Dehnen", "stretch", 1, DEFAULT_STRETCH_SECONDS),
+  ]};
 }
 
+// Neue Accounts starten komplett leer - kein Beispielplan mehr.
+// Der Weg zum ersten Plan fuehrt bewusst ueber "Trainingsziele festlegen" (generiert oder manuell).
 const DEFAULT_PLAN = {
   schemaVersion: CURRENT_PLAN_SCHEMA_VERSION,
   setPauseSeconds: 60,
   pauseSeconds: 15,
   soundOn: true,
-  days: [
-    { name: "Push", exercises: [
-      makeWarmup(60),
-      makeExercise("Liegestütz", "chest", 4, 30),
-      makeExercise("Langhantel Schulterdrücken", "shoulders", 4, 30),
-      makeExercise("Hanteln Seitheben", "shoulders", 3, 30),
-      makeExercise("Trizeps mit Band", "triceps", 3, 30),
-      makeStretch(120),
-    ]},
-    { name: "Pull", exercises: [
-      makeWarmup(60),
-      makeExercise("Langhantel vorgebeugtes Rudern", "back", 4, 30),
-      makeExercise("Band vorne auseinanderziehen", "back", 3, 30),
-      makeExercise("Band schräg oben-unten", "back", 3, 30),
-      makeExercise("Hanteln Bizeps Curls", "biceps", 3, 30),
-      makeExercise("Langhantel Bizeps Curls", "biceps", 3, 30),
-      makeStretch(120),
-    ]},
-    { name: "Beine", exercises: [
-      makeWarmup(60),
-      makeExercise("Langhantel Kniebeugen", "legs", 4, 30),
-      makeExercise("Langhantel Ausfallschritte", "legs", 3, 30),
-      makeExercise("Wadenheben mit Hanteln", "legs", 3, 30),
-      makeExercise("Bauchrolle", "abs", 3, 30),
-      makeExercise("Situps", "abs", 3, 30),
-      makeExercise("Seitliches Bauchtraining", "abs", 3, 30),
-      makeStretch(120),
-    ]},
-  ]
+  days: []
 };
 
 const state = {
@@ -282,25 +261,48 @@ function migratePlan(plan){
     version = 2;
   }
   if(version < 3){
-    const legacyWarmup = plan.warmupSeconds;
-    const legacyStretch = plan.stretchSeconds;
     (plan.days || []).forEach(d => {
-      d.exercises = d.exercises || [];
-      d.exercises.forEach(ex => {
-        if(!ex.type) ex.type = 'exercise';
+      (d.exercises || []).forEach(ex => {
         if(ex.pauseAfterOverride === undefined) ex.pauseAfterOverride = null;
         if(ex.setPauseOverride === undefined) ex.setPauseOverride = null;
       });
-      if(!d.exercises.some(e => e.type === 'warmup') && legacyWarmup > 0){
-        d.exercises.unshift(makeWarmup(legacyWarmup));
-      }
-      if(!d.exercises.some(e => e.type === 'stretch') && legacyStretch > 0){
-        d.exercises.push(makeStretch(legacyStretch));
-      }
+    });
+    version = 3;
+  }
+  if(version < 4){
+    // v3 bildete Aufwaermen/Dehnen kurzzeitig als eigene "Sätze" (type:'warmup'/'stretch') ab.
+    // Seit v4 sind das wieder simple Tages-Felder (warmupSeconds/stretchSeconds).
+    const legacyWarmup = plan.warmupSeconds; // nur bei sehr alten (v1/v2) Dokumenten vorhanden
+    const legacyStretch = plan.stretchSeconds;
+    (plan.days || []).forEach(d => {
+      d.exercises = d.exercises || [];
+      let warmupSeconds = null;
+      let stretchSeconds = null;
+      d.exercises = d.exercises.filter(ex => {
+        if(ex.type === 'warmup'){ warmupSeconds = ex.seconds; return false; }
+        if(ex.type === 'stretch'){ stretchSeconds = ex.seconds; return false; }
+        delete ex.type;
+        return true;
+      });
+      d.warmupSeconds = warmupSeconds != null ? warmupSeconds : (legacyWarmup > 0 ? legacyWarmup : DEFAULT_WARMUP_SECONDS);
+      d.stretchSeconds = stretchSeconds != null ? stretchSeconds : (legacyStretch > 0 ? legacyStretch : DEFAULT_STRETCH_SECONDS);
     });
     delete plan.warmupSeconds;
     delete plan.stretchSeconds;
-    version = 3;
+    version = 4;
+  }
+  if(version < 5){
+    // Aufwaermen/Dehnen sind kein Sonderfall mehr, sondern ganz normale (vorbelegte) Uebungen.
+    (plan.days || []).forEach(d => {
+      d.exercises = d.exercises || [];
+      const warmupSeconds = d.warmupSeconds != null ? d.warmupSeconds : DEFAULT_WARMUP_SECONDS;
+      const stretchSeconds = d.stretchSeconds != null ? d.stretchSeconds : DEFAULT_STRETCH_SECONDS;
+      d.exercises.unshift(makeExercise(t('timer.warmup'), 'warmup', 1, warmupSeconds));
+      d.exercises.push(makeExercise(t('timer.stretch'), 'stretch', 1, stretchSeconds));
+      delete d.warmupSeconds;
+      delete d.stretchSeconds;
+    });
+    version = 5;
   }
   plan.schemaVersion = CURRENT_PLAN_SCHEMA_VERSION;
   return plan;
@@ -375,7 +377,7 @@ async function persistSettings(){
 const EQUIPMENT_IDS = ["dumbbells","barbell","resistance_bands","pullup_bar","bench","kettlebell","machines","bodyweight_only","cardio_equipment"];
 const FOCUS_IDS = ["strength","hypertrophy","endurance","weight_loss","mobility","general_fitness"];
 
-let onboarding = { equipment: [], focus: [], constraints: '', hoursPerWeek: null, completed: false };
+let onboarding = { equipment: [], focus: [], constraints: '', daysPerWeek: null, sessionMinutes: null, completed: false };
 let onboardingCardDismissed = false;
 let onboardingSaveTimeout = null;
 
@@ -392,6 +394,192 @@ async function persistOnboarding(){
       onboarding: { ...onboarding, updatedAt: firebase.firestore.FieldValue.serverTimestamp() }
     }, { merge: true });
   }catch(e){ /* Onboarding-Daten sind sekundaer, kein User-Feedback noetig */ }
+}
+
+/* ---------- Trainingsplan-Generator (Uebungs-Bibliothek + Zusammenstell-Logik) ---------- */
+let exerciseLibrary = null;
+let exerciseLibraryPromise = null;
+
+function loadExerciseLibrary(){
+  if(!exerciseLibraryPromise){
+    exerciseLibraryPromise = fetch('data/exercises.json').then(res => {
+      if(!res.ok) throw new Error('exercise library not found');
+      return res.json();
+    }).then(data => { exerciseLibrary = data; return data; });
+  }
+  return exerciseLibraryPromise;
+}
+
+const FOCUS_PARAMS = {
+  strength: { sets: 4, seconds: 40 },
+  hypertrophy: { sets: 4, seconds: 35 },
+  endurance: { sets: 3, seconds: 25 },
+  weight_loss: { sets: 3, seconds: 30 },
+  mobility: { sets: 2, seconds: 35 },
+  general_fitness: { sets: 3, seconds: 30 }
+};
+
+function resolveSetsSeconds(focusArray){
+  const rows = (focusArray && focusArray.length ? focusArray : ['general_fitness'])
+    .map(f => FOCUS_PARAMS[f] || FOCUS_PARAMS.general_fitness);
+  const avg = key => rows.reduce((sum, r) => sum + r[key], 0) / rows.length;
+  return {
+    sets: Math.max(2, Math.round(avg('sets'))),
+    seconds: Math.max(15, Math.round(avg('seconds') / 5) * 5)
+  };
+}
+
+function clampDaysPerWeek(daysPerWeek){
+  if(!(daysPerWeek > 0)) return 3; // Standard, falls nichts angegeben
+  return Math.max(1, Math.min(6, Math.round(daysPerWeek))); // Deckel bei 6, damindestens ein Ruhetag bleibt
+}
+
+// Slot-Anzahl je Tag an die gewuenschte Einheiten-Dauer anpassen (Basis: ~50 Min. fuer die Standard-Slotzahl).
+function slotCountAdjustment(sessionMinutes){
+  const m = sessionMinutes > 0 ? sessionMinutes : 50;
+  if(m <= 30) return -2;
+  if(m <= 40) return -1;
+  if(m >= 90) return 2;
+  if(m >= 70) return 1;
+  return 0;
+}
+function applyDurationAdjustment(slots, sessionMinutes){
+  const adj = slotCountAdjustment(sessionMinutes);
+  let result = slots.slice();
+  if(adj < 0){
+    result = result.slice(0, Math.max(3, result.length + adj));
+  } else if(adj > 0 && result.length > 0){
+    for(let i = 0; i < adj; i++) result.push(result[0]);
+  }
+  return result;
+}
+
+const SPLIT_SLOTS = {
+  full_body: ['legs','legs','chest','back','shoulders','abs'],
+  upper: ['chest','chest','back','back','shoulders','biceps','triceps'],
+  lower: ['legs','legs','legs','legs','abs','abs'],
+  push: ['chest','chest','shoulders','shoulders','triceps','triceps'],
+  pull: ['back','back','back','biceps','biceps'],
+  legs: ['legs','legs','legs','legs','abs','abs']
+};
+
+function decideSplit({ equipment, focus, daysPerWeek, sessionMinutes }){
+  const dayCount = clampDaysPerWeek(daysPerWeek);
+  const wantsStrengthFocus = focus.includes('strength') || focus.includes('hypertrophy');
+  const wantsCardioFinisher = focus.includes('weight_loss') || focus.includes('endurance');
+
+  let pattern; // array of {key,nameKey,nameVars}
+  if(dayCount <= 2){
+    pattern = Array.from({length: dayCount}, (_, i) => ({ key:'full_body', nameKey:'splitDay.fullBody', nameVars:{n:i+1} }));
+  } else if(dayCount === 3){
+    pattern = wantsStrengthFocus
+      ? [{key:'push', nameKey:'splitDay.push'}, {key:'pull', nameKey:'splitDay.pull'}, {key:'legs', nameKey:'splitDay.legs'}]
+      : Array.from({length:3}, (_, i) => ({ key:'full_body', nameKey:'splitDay.fullBody', nameVars:{n:i+1} }));
+  } else if(dayCount === 4){
+    pattern = [
+      {key:'upper', nameKey:'splitDay.upper'}, {key:'lower', nameKey:'splitDay.lower'},
+      {key:'upper', nameKey:'splitDay.upper'}, {key:'lower', nameKey:'splitDay.lower'}
+    ];
+  } else {
+    const cycle = [
+      {key:'push', nameKey:'splitDay.push'}, {key:'pull', nameKey:'splitDay.pull'}, {key:'legs', nameKey:'splitDay.legs'}
+    ];
+    pattern = Array.from({length: dayCount}, (_, i) => cycle[i % 3]);
+  }
+
+  const days = pattern.map(p => {
+    let slots = SPLIT_SLOTS[p.key].slice();
+    if(wantsCardioFinisher) slots.push('cardio');
+    slots = applyDurationAdjustment(slots, sessionMinutes);
+    return { nameKey: p.nameKey, nameVars: p.nameVars, slots };
+  });
+  return { days };
+}
+
+// Eine Uebung passt nur, wenn ALLE ihre benoetigten Geraete auch ausgewaehlt wurden (nicht nur irgendeins) -
+// z.B. Bankdruecken braucht wirklich Langhantel UND Bank, nicht nur eines von beiden.
+function matchesEquipment(entry, equipment){
+  return entry.equipment.every(id => equipment.includes(id));
+}
+function isPureBodyweight(entry){
+  return entry.equipment.length === 1 && entry.equipment[0] === 'bodyweight_only';
+}
+
+function pickExercisesForSlots(slots, library, equipment, focus, usedIds){
+  const picked = [];
+  slots.forEach(muscle => {
+    let candidates = library.filter(e => e.muscle === muscle && matchesEquipment(e, equipment));
+    if(candidates.length === 0){
+      // Fallback: reine Koerpergewichtsuebungen fuer diese Gruppe, damit ein Slot nie leer bleibt
+      // (unabhaengig davon, ob "Nur Koerpergewicht" explizit angehakt wurde).
+      candidates = library.filter(e => e.muscle === muscle && isPureBodyweight(e));
+    }
+    if(candidates.length === 0) return; // Bibliothek deckt diese Gruppe gar nicht ab - Slot auslassen statt abzustuerzen
+    const preferred = candidates.filter(e => e.focus.some(f => focus.includes(f)));
+    const pool = preferred.length ? preferred : candidates;
+    const fresh = pool.filter(e => !usedIds.has(e.id));
+    const finalPool = fresh.length ? fresh : pool;
+    const chosen = finalPool[Math.floor(Math.random() * finalPool.length)];
+    usedIds.add(chosen.id);
+    picked.push(chosen);
+  });
+  return picked;
+}
+
+function generatePlanDays(onboardingData, library){
+  const equipment = onboardingData.equipment || [];
+  const focus = onboardingData.focus || [];
+  const splitPlan = decideSplit({ equipment, focus, daysPerWeek: onboardingData.daysPerWeek, sessionMinutes: onboardingData.sessionMinutes });
+  const { sets, seconds } = resolveSetsSeconds(focus);
+  const usedIds = new Set();
+  return splitPlan.days.map(d => {
+    const picked = pickExercisesForSlots(d.slots, library, equipment, focus, usedIds);
+    const exercises = picked.map(entry => makeExercise(entry.name, entry.muscle, sets, seconds));
+    return makeDay(t(d.nameKey, d.nameVars), exercises);
+  });
+}
+
+let onboardingGenerating = false;
+let onboardingGenerateError = '';
+
+async function runGeneration(){
+  onboardingGenerateError = '';
+  onboardingGenerating = true; render();
+  let library;
+  try{
+    library = exerciseLibrary || await loadExerciseLibrary();
+  }catch(e){
+    onboardingGenerating = false;
+    onboardingGenerateError = t('onboarding.libraryLoadError');
+    render();
+    return;
+  }
+  state.plan.days = generatePlanDays(onboarding, library);
+  ensureIds();
+  onboarding.completed = true;
+  onboardingGenerating = false;
+  persistOnboarding();
+  await persistPlan();
+  state.expandedDayIds = new Set();
+  state.screen = 'main';
+  render();
+}
+
+function openRegeneratePlanModal(onConfirm){
+  openModal((close) => {
+    const wrap = el('div', {});
+    wrap.appendChild(el('div', {class:'modal-title'}, [t('onboarding.regenerateModalTitle')]));
+    wrap.appendChild(el('div', {class:'sub'}, [t('onboarding.regenerateModalText')]));
+    const actions = el('div', {class:'modal-actions'});
+    const cancelBtn = el('button', {class:'btn'}, [t('common.cancel')]);
+    cancelBtn.addEventListener('click', close);
+    const confirmBtn = el('button', {class:'btn btn-primary'}, [t('onboarding.regenerateModalConfirm')]);
+    confirmBtn.addEventListener('click', () => { close(); onConfirm(); });
+    actions.appendChild(cancelBtn);
+    actions.appendChild(confirmBtn);
+    wrap.appendChild(actions);
+    return wrap;
+  });
 }
 
 async function loadPlanForCurrentUser(){
@@ -414,9 +602,9 @@ async function loadPlanForCurrentUser(){
       if(settings.theme) applyTheme(settings.theme);
     }
     if(data && data.onboarding){
-      onboarding = Object.assign({ equipment: [], focus: [], constraints: '', hoursPerWeek: null, completed: false }, data.onboarding);
+      onboarding = Object.assign({ equipment: [], focus: [], constraints: '', daysPerWeek: null, sessionMinutes: null, completed: false }, data.onboarding);
     } else {
-      onboarding = { equipment: [], focus: [], constraints: '', hoursPerWeek: null, completed: false };
+      onboarding = { equipment: [], focus: [], constraints: '', daysPerWeek: null, sessionMinutes: null, completed: false };
     }
     onboardingCardDismissed = false;
   }catch(e){
@@ -459,7 +647,7 @@ function beep(freq, durationMs, gain){
   }catch(e){ /* Ton nicht verfügbar, ignorieren */ }
 }
 function beepForMode(mode){
-  const restLike = (mode === 'pause' || mode === 'stretch');
+  const restLike = (mode === 'pause');
   if(restLike){
     beep(392, 260, 0.6);
     setTimeout(() => beep(294, 360, 0.6), 220);
@@ -490,21 +678,9 @@ let steps = [];
 let stepStartOffsets = [];
 let stepsTotalSeconds = 0;
 
-function regularExercises(day){
-  return day.exercises.filter(e => e.type !== 'warmup' && e.type !== 'stretch');
-}
-function getWarmup(day){ return day.exercises.find(e => e.type === 'warmup'); }
-function getStretch(day){ return day.exercises.find(e => e.type === 'stretch'); }
-
 function buildSteps(day){
   const s = [];
-  const warmup = getWarmup(day);
-  const stretch = getStretch(day);
-  const exercises = regularExercises(day);
-
-  if(warmup && warmup.seconds > 0){
-    s.push({ mode:'warmup', seconds: warmup.seconds });
-  }
+  const exercises = day.exercises;
   exercises.forEach((ex, exIdx) => {
     const sets = Math.max(1, ex.sets || 1);
     const secs = Math.max(1, ex.seconds || 1);
@@ -518,9 +694,6 @@ function buildSteps(day){
       }
     }
   });
-  if(stretch && stretch.seconds > 0){
-    s.push({ mode:'stretch', seconds: stretch.seconds });
-  }
   return s;
 }
 
@@ -906,17 +1079,29 @@ function renderOnboardingScreen(){
   card.appendChild(el('div', {class:'card-title', style:{marginTop:'16px'}}, [t('onboarding.focus')]));
   card.appendChild(buildCheckboxList(FOCUS_IDS, 'focus.', onboarding.focus, () => scheduleOnboardingPersist()));
 
-  const hoursField = el('div', {class:'field', style:{marginTop:'16px'}});
-  hoursField.appendChild(el('label', {}, [t('onboarding.hoursPerWeek')]));
-  const hoursInput = el('input', {type:'number', min:'0', step:'0.5'});
-  hoursInput.value = onboarding.hoursPerWeek != null ? onboarding.hoursPerWeek : '';
-  hoursInput.addEventListener('input', e => {
-    const v = parseFloat(e.target.value);
-    onboarding.hoursPerWeek = isNaN(v) ? null : v;
+  const daysField = el('div', {class:'field', style:{marginTop:'16px'}});
+  daysField.appendChild(el('label', {}, [t('onboarding.daysPerWeek')]));
+  const daysInput = el('input', {type:'number', min:'1', max:'7', step:'1'});
+  daysInput.value = onboarding.daysPerWeek != null ? onboarding.daysPerWeek : '';
+  daysInput.addEventListener('input', e => {
+    const v = parseInt(e.target.value, 10);
+    onboarding.daysPerWeek = isNaN(v) ? null : v;
     scheduleOnboardingPersist();
   });
-  hoursField.appendChild(hoursInput);
-  card.appendChild(hoursField);
+  daysField.appendChild(daysInput);
+  card.appendChild(daysField);
+
+  const minutesField = el('div', {class:'field', style:{marginTop:'8px'}});
+  minutesField.appendChild(el('label', {}, [t('onboarding.sessionMinutes')]));
+  const minutesInput = el('input', {type:'number', min:'10', step:'5'});
+  minutesInput.value = onboarding.sessionMinutes != null ? onboarding.sessionMinutes : '';
+  minutesInput.addEventListener('input', e => {
+    const v = parseInt(e.target.value, 10);
+    onboarding.sessionMinutes = isNaN(v) ? null : v;
+    scheduleOnboardingPersist();
+  });
+  minutesField.appendChild(minutesInput);
+  card.appendChild(minutesField);
 
   const constraintsField = el('div', {class:'auth-field', style:{marginTop:'12px'}});
   constraintsField.appendChild(el('label', {}, [t('onboarding.constraints')]));
@@ -931,14 +1116,32 @@ function renderOnboardingScreen(){
 
   wrap.appendChild(card);
 
-  const saveBtn = el('button', {class:'btn btn-primary btn-block'}, [t('onboarding.save')]);
-  saveBtn.addEventListener('click', () => {
+  if(onboardingGenerateError) wrap.appendChild(el('div', {class:'auth-error'}, [onboardingGenerateError]));
+
+  const actionsRow = el('div', {class:'onboarding-card-actions'});
+
+  const wasCompleted = onboarding.completed;
+  const generateBtn = el('button', {class:'btn btn-primary btn-block'}, [
+    onboardingGenerating ? t('onboarding.generating') : t(wasCompleted ? 'onboarding.regenerateButton' : 'onboarding.generateButton')
+  ]);
+  generateBtn.disabled = onboardingGenerating;
+  generateBtn.addEventListener('click', () => {
+    if(wasCompleted) openRegeneratePlanModal(runGeneration);
+    else runGeneration();
+  });
+  actionsRow.appendChild(generateBtn);
+
+  const saveOnlyBtn = el('button', {class:'btn btn-block'}, [t('onboarding.saveOnlyButton')]);
+  saveOnlyBtn.disabled = onboardingGenerating;
+  saveOnlyBtn.addEventListener('click', () => {
     onboarding.completed = true;
     persistOnboarding();
     state.screen = 'main';
     render();
   });
-  wrap.appendChild(saveBtn);
+  actionsRow.appendChild(saveOnlyBtn);
+
+  wrap.appendChild(actionsRow);
 
   return wrap;
 }
@@ -1065,14 +1268,14 @@ function renderMainView(){
 
   if(!onboarding.completed && !onboardingCardDismissed){
     const obCard = el('div', {class:'card onboarding-card'});
-    obCard.appendChild(el('div', {class:'card-title'}, [t('onboarding.dismissCardTitle')]));
-    obCard.appendChild(el('div', {class:'sub', style:{margin:'0'}}, [t('onboarding.dismissCardText')]));
+    obCard.appendChild(el('div', {class:'card-title'}, [t('onboarding.introTitle')]));
+    obCard.appendChild(el('div', {class:'sub', style:{margin:'0 0 4px'}}, [t('onboarding.introText')]));
     const obActions = el('div', {class:'onboarding-card-actions'});
-    const dismissBtn = el('button', {class:'btn'}, ['✕']);
-    dismissBtn.addEventListener('click', () => { onboardingCardDismissed = true; render(); });
-    const fillBtn = el('button', {class:'btn btn-primary'}, [t('onboarding.dismissCardButton')]);
+    const skipBtn = el('button', {class:'btn'}, [t('onboarding.introSkip')]);
+    skipBtn.addEventListener('click', () => { onboardingCardDismissed = true; render(); });
+    const fillBtn = el('button', {class:'btn btn-primary'}, [t('onboarding.introStart')]);
     fillBtn.addEventListener('click', () => { state.screen = 'onboarding'; render(); });
-    obActions.appendChild(dismissBtn);
+    obActions.appendChild(skipBtn);
     obActions.appendChild(fillBtn);
     obCard.appendChild(obActions);
     wrap.appendChild(obCard);
@@ -1087,6 +1290,9 @@ function renderMainView(){
   wrap.appendChild(soundRow);
 
   // Tage
+  if(state.plan.days.length === 0){
+    wrap.appendChild(el('div', {class:'empty-note'}, [t('main.noDaysYet')]));
+  }
   state.plan.days.forEach((day, dayIdx) => {
     wrap.appendChild(renderDayCard(day, dayIdx));
   });
@@ -1145,48 +1351,19 @@ function renderDayCard(day, dayIdx){
   if(isExpanded){
     const body = el('div', {class:'collapsible-body'});
 
-    const warmupEx = getWarmup(day);
-    if(warmupEx){
-      body.appendChild(renderSpecialRow(day, warmupEx));
-    } else {
-      const addWarmupBtn = el('button', {class:'btn add-ex-btn'}, [t('day.addWarmup')]);
-      addWarmupBtn.addEventListener('click', () => {
-        day.exercises.unshift(makeWarmup(60));
-        schedulePersist();
-        render();
-      });
-      body.appendChild(addWarmupBtn);
-    }
-
-    const regulars = regularExercises(day);
-    if(regulars.length === 0){
+    if(day.exercises.length === 0){
       body.appendChild(el('div', {class:'empty-note'}, [t('day.noExercisesYet')]));
     }
-    regulars.forEach((ex, exIdx) => {
-      body.appendChild(renderExerciseRow(day, ex, exIdx, regulars.length));
+    day.exercises.forEach((ex, exIdx) => {
+      body.appendChild(renderExerciseRow(day, ex, exIdx));
     });
     const addExBtn = el('button', {class:'btn add-ex-btn'}, [t('day.addExercise')]);
     addExBtn.addEventListener('click', () => {
-      const stretchEx = getStretch(day);
-      const insertAt = stretchEx ? day.exercises.indexOf(stretchEx) : day.exercises.length;
-      day.exercises.splice(insertAt, 0, makeExercise('', MUSCLE_GROUP_IDS[0], 3, 30));
+      day.exercises.push(makeExercise('', MUSCLE_GROUP_IDS[0], 3, 30));
       schedulePersist();
       render();
     });
     body.appendChild(addExBtn);
-
-    const stretchEx = getStretch(day);
-    if(stretchEx){
-      body.appendChild(renderSpecialRow(day, stretchEx));
-    } else {
-      const addStretchBtn = el('button', {class:'btn add-ex-btn'}, [t('day.addStretch')]);
-      addStretchBtn.addEventListener('click', () => {
-        day.exercises.push(makeStretch(120));
-        schedulePersist();
-        render();
-      });
-      body.appendChild(addStretchBtn);
-    }
 
     card.appendChild(body);
   }
@@ -1194,64 +1371,28 @@ function renderDayCard(day, dayIdx){
   return card;
 }
 
-function renderSpecialRow(day, ex){
-  const row = el('div', {class:'exercise-row special-row'});
-  const content = el('div', {class:'ex-content'});
-
-  const line1 = el('div', {class:'ex-line1'});
-  line1.appendChild(el('div', {class:'special-label'}, [t(ex.type === 'warmup' ? 'timer.warmup' : 'timer.stretch')]));
-  const delBtn = el('button', {class:'icon-btn'}, ['✕']);
-  delBtn.addEventListener('click', () => {
-    const idx = day.exercises.indexOf(ex);
-    if(idx >= 0) day.exercises.splice(idx, 1);
-    schedulePersist();
-    render();
-  });
-  line1.appendChild(delBtn);
-  content.appendChild(line1);
-
-  const line2 = el('div', {class:'ex-line2'});
-  const secField = el('div', {class:'field-mini'});
-  secField.appendChild(el('label', {}, [t('exercise.durationSeconds')]));
-  const secInput = el('input', {type:'number', min:'5', step:'5'});
-  secInput.value = ex.seconds;
-  secInput.addEventListener('input', e => {
-    ex.seconds = Math.max(5, parseInt(e.target.value||'30',10));
-    schedulePersist();
-    updateDayTotalDisplay(day);
-  });
-  secField.appendChild(secInput);
-  line2.appendChild(secField);
-  content.appendChild(line2);
-
-  row.appendChild(content);
-  return row;
-}
-
 function updateDayTotalDisplay(day){
   const elm = document.querySelector(`.day-total[data-day-id="${day.id}"]`);
   if(elm) elm.textContent = t('day.totalDuration', {duration: formatMinSec(dayTotalSeconds(day))});
 }
 
-function renderExerciseRow(day, ex, exIdx, totalRegular){
+function renderExerciseRow(day, ex, exIdx){
   const row = el('div', {class:'exercise-row'});
 
   const reorderBox = el('div', {class:'reorder-box'});
   const upBtn = el('button', {class:'icon-btn reorder-btn'}, ['▲']);
   upBtn.disabled = (exIdx === 0);
   upBtn.addEventListener('click', () => {
-    const realIdx = day.exercises.indexOf(ex);
-    if(realIdx <= 0) return;
-    [day.exercises[realIdx-1], day.exercises[realIdx]] = [day.exercises[realIdx], day.exercises[realIdx-1]];
+    if(exIdx === 0) return;
+    [day.exercises[exIdx-1], day.exercises[exIdx]] = [day.exercises[exIdx], day.exercises[exIdx-1]];
     schedulePersist();
     render();
   });
   const downBtn = el('button', {class:'icon-btn reorder-btn'}, ['▼']);
-  downBtn.disabled = (exIdx === totalRegular - 1);
+  downBtn.disabled = (exIdx === day.exercises.length - 1);
   downBtn.addEventListener('click', () => {
-    const realIdx = day.exercises.indexOf(ex);
-    if(realIdx < 0 || realIdx >= day.exercises.length - 1) return;
-    [day.exercises[realIdx+1], day.exercises[realIdx]] = [day.exercises[realIdx], day.exercises[realIdx+1]];
+    if(exIdx === day.exercises.length - 1) return;
+    [day.exercises[exIdx+1], day.exercises[exIdx]] = [day.exercises[exIdx], day.exercises[exIdx+1]];
     schedulePersist();
     render();
   });
@@ -1451,14 +1592,13 @@ function peekNext(fromIndex){
   for(let i=fromIndex+1; i<steps.length; i++){
     const st = steps[i];
     if(st.mode === 'exercise') return { type:'exercise', name: st.name, setNum: st.setNum, totalSets: st.totalSets };
-    if(st.mode === 'stretch') return { type:'stretch' };
   }
   return null;
 }
 
 function renderTimerScreen(){
   const s = steps[state.stepIndex];
-  const isRestColor = (s.mode === 'pause' || s.mode === 'stretch');
+  const isRestColor = (s.mode === 'pause');
   const wrap = el('div', {class:'wrap timer-screen'});
 
   let primary = '';
@@ -1471,7 +1611,6 @@ function renderTimerScreen(){
     if(s.setNum === s.totalSets){
       const nxt = peekNext(state.stepIndex);
       if(nxt && nxt.type === 'exercise') hint = t('timer.nextExercise', {name: nxt.name});
-      else if(nxt && nxt.type === 'stretch') hint = t('timer.afterStretch');
     }
   } else if(s.mode === 'pause'){
     primary = t('timer.pause');
@@ -1480,16 +1619,7 @@ function renderTimerScreen(){
       secondary = (nextStep.setNum === 1)
         ? t('timer.nextExercise', {name: nextStep.name})
         : t('timer.continueWith', {name: nextStep.name, set: nextStep.setNum, total: nextStep.totalSets});
-    } else if(nextStep && nextStep.mode === 'stretch'){
-      secondary = t('timer.soonStretch');
     }
-  } else if(s.mode === 'warmup'){
-    primary = t('timer.warmup');
-    const nextStep = steps[state.stepIndex+1];
-    if(nextStep && nextStep.mode === 'exercise') secondary = t('timer.firstExercise', {name: nextStep.name});
-  } else if(s.mode === 'stretch'){
-    primary = t('timer.stretch');
-    secondary = t('timer.almostDone');
   }
 
   wrap.appendChild(el('div', {class:'timer-meta'}, [t('timer.stepMeta', {day: state.currentDayName, current: state.stepIndex+1, total: steps.length})]));
@@ -1569,12 +1699,13 @@ function updateTimerDOM(){
     if(user){
       authUser = user;
       loadPlanForCurrentUser();
+      loadExerciseLibrary().catch(()=>{}); // Vorladen, damit sie beim Onboarding meist schon bereitsteht
     } else {
       authUser = null;
       state.plan = deepClone(DEFAULT_PLAN);
       state.screen = 'main';
       settings = { theme: null, language: null };
-      onboarding = { equipment: [], focus: [], constraints: '', hoursPerWeek: null, completed: false };
+      onboarding = { equipment: [], focus: [], constraints: '', daysPerWeek: null, sessionMinutes: null, completed: false };
       onboardingCardDismissed = false;
       historySessions = null;
       ensureIds();

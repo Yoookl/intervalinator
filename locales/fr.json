@@ -137,6 +137,12 @@
   "focus.mobility": "Mobilité",
   "focus.general_fitness": "Forme générale",
 
+  "history.title": "Historique",
+  "history.subtitle": "Tes entraînements terminés des 30 derniers jours",
+  "history.back": "Retour",
+  "history.empty": "Pas encore d'entraînements terminés au cours des 30 derniers jours.",
+  "history.countBadge": "{count}×",
+
   "timer.pause": "Pause",
   "timer.warmup": "Échauffement",
   "timer.stretch": "Étirement",

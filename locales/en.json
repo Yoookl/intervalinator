@@ -137,6 +137,12 @@
   "focus.mobility": "Mobility",
   "focus.general_fitness": "General fitness",
 
+  "history.title": "History",
+  "history.subtitle": "Your completed workouts from the last 30 days",
+  "history.back": "Back",
+  "history.empty": "No completed workouts in the last 30 days yet.",
+  "history.countBadge": "{count}×",
+
   "timer.pause": "Rest",
   "timer.warmup": "Warmup",
   "timer.stretch": "Stretch",

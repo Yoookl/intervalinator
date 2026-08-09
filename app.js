@@ -668,6 +668,10 @@ function render(){
     app.appendChild(renderOnboardingScreen());
     return;
   }
+  if(state.screen === 'history'){
+    app.appendChild(renderHistoryScreen());
+    return;
+  }
   app.appendChild(renderMainView());
 }
 
@@ -939,11 +943,115 @@ function renderOnboardingScreen(){
   return wrap;
 }
 
+/* ---------- Historie ---------- */
+let historyLoading = false;
+let historySessions = null; // null = noch nicht geladen
+let historyError = '';
+let expandedExerciseKeys = new Set();
+
+async function loadHistory(){
+  if(!authUser) return;
+  historyLoading = true; historyError = ''; render();
+  try{
+    const cutoff = new Date(Date.now() - 30*24*60*60*1000);
+    const snap = await db.collection('users').doc(authUser.uid).collection('sessions')
+      .where('finishedAt', '>=', cutoff)
+      .orderBy('finishedAt', 'desc')
+      .get();
+    historySessions = snap.docs.map(d => d.data());
+  }catch(e){
+    historyError = e.message || t('error.unknown');
+    historySessions = [];
+  }
+  historyLoading = false;
+  render();
+}
+
+function aggregateByExercise(sessions){
+  const map = new Map();
+  sessions.forEach(s => {
+    (s.exercises || []).forEach(ex => {
+      const key = ex.name + '|' + (ex.muscle || '');
+      if(!map.has(key)) map.set(key, { name: ex.name, muscle: ex.muscle, count: 0, sessions: [] });
+      const entry = map.get(key);
+      entry.count += 1;
+      entry.sessions.push(s);
+    });
+  });
+  return Array.from(map.values()).sort((a,b) => b.count - a.count);
+}
+
+function renderHistoryExerciseCard(entry){
+  const card = el('div', {class:'card'});
+  const key = entry.name + '|' + (entry.muscle || '');
+  const isExpanded = expandedExerciseKeys.has(key);
+
+  const head = el('div', {class:'collapsible-head'});
+  head.appendChild(el('span', {class:`chevron ${isExpanded?'open':''}`}, ['▸']));
+  const titleWrap = el('div', {style:{flex:'1'}});
+  titleWrap.appendChild(el('div', {}, [entry.name || t('exercise.namePlaceholder')]));
+  if(entry.muscle) titleWrap.appendChild(el('div', {class:'collapsible-title'}, [t('muscle.'+entry.muscle)]));
+  head.appendChild(titleWrap);
+  head.appendChild(el('div', {class:'pause-value'}, [t('history.countBadge', {count: entry.count})]));
+  head.addEventListener('click', () => {
+    if(isExpanded) expandedExerciseKeys.delete(key); else expandedExerciseKeys.add(key);
+    render();
+  });
+  card.appendChild(head);
+
+  if(isExpanded){
+    const body = el('div', {class:'collapsible-body'});
+    entry.sessions.slice(0, 10).forEach(s => {
+      const dateStr = (s.finishedAt && s.finishedAt.toDate) ? s.finishedAt.toDate().toLocaleDateString() : '';
+      body.appendChild(el('div', {class:'collapsible-summary'}, [`${dateStr} · ${s.dayName || ''}`]));
+    });
+    card.appendChild(body);
+  }
+
+  return card;
+}
+
+function renderHistoryScreen(){
+  const wrap = el('div', {});
+
+  const head = el('div', {class:'user-bar'});
+  const backBtn = el('button', {class:'btn logout-btn'}, ['← ' + t('history.back')]);
+  backBtn.addEventListener('click', () => { state.screen = 'main'; render(); });
+  head.appendChild(backBtn);
+  wrap.appendChild(head);
+
+  wrap.appendChild(el('h1', {}, [t('history.title')]));
+  wrap.appendChild(el('div', {class:'sub'}, [t('history.subtitle')]));
+
+  if(historyLoading || historySessions === null){
+    wrap.appendChild(el('div', {class:'empty-note'}, [t('common.loading')]));
+    return wrap;
+  }
+  if(historyError){
+    wrap.appendChild(el('div', {class:'auth-error'}, [historyError]));
+  }
+
+  const completedSessions = historySessions.filter(s => s.completed);
+  if(completedSessions.length === 0){
+    wrap.appendChild(el('div', {class:'empty-note'}, [t('history.empty')]));
+    return wrap;
+  }
+
+  aggregateByExercise(completedSessions).forEach(entry => {
+    wrap.appendChild(renderHistoryExerciseCard(entry));
+  });
+
+  return wrap;
+}
+
 function renderMainView(){
   const wrap = el('div', {});
   const userBar = el('div', {class:'user-bar'});
   userBar.appendChild(el('span', {class:'user-email'}, [authUser.email || '']));
   const userBarBtns = el('div', {class:'user-bar-btns'});
+  const historyBtn = el('button', {class:'btn logout-btn'}, ['📊']);
+  historyBtn.addEventListener('click', () => { state.screen = 'history'; historySessions = null; render(); loadHistory(); });
+  userBarBtns.appendChild(historyBtn);
   const settingsBtn = el('button', {class:'btn logout-btn'}, ['⚙']);
   settingsBtn.addEventListener('click', () => { state.screen = 'profile'; render(); });
   userBarBtns.appendChild(settingsBtn);
@@ -1226,6 +1334,8 @@ function renderExerciseRow(day, ex, exIdx, totalRegular){
 
 
 /* ---------- Timer-Ablauf ---------- */
+let sessionStartStamp = null;
+
 function startTimer(day){
   ensureAudio();
   steps = buildSteps(day);
@@ -1236,6 +1346,7 @@ function startTimer(day){
   state.remaining = steps[0].seconds;
   state.paused = false;
   state.currentDayName = day.name;
+  sessionStartStamp = new Date();
 
   beepForMode(steps[0].mode);
 
@@ -1271,12 +1382,56 @@ function advanceStep(){
 
 function skipStep(){ advanceStep(); }
 function togglePause(){ state.paused = !state.paused; render(); }
+function computeSessionSummary(fullyFinished){
+  const completedUpToIndex = fullyFinished ? steps.length : state.stepIndex;
+  const elapsed = fullyFinished ? stepsTotalSeconds : elapsedSeconds();
+  const completionFraction = stepsTotalSeconds > 0 ? elapsed / stepsTotalSeconds : 0;
+
+  const exerciseMap = new Map();
+  for(let i = 0; i < completedUpToIndex; i++){
+    const s = steps[i];
+    if(s.mode !== 'exercise') continue;
+    const key = s.name + '|' + (s.muscle || '');
+    if(!exerciseMap.has(key)){
+      exerciseMap.set(key, { name: s.name, muscle: s.muscle, reachedSets: 0, totalSets: s.totalSets });
+    }
+    exerciseMap.get(key).reachedSets += 1;
+  }
+
+  return {
+    dayName: state.currentDayName,
+    exercises: Array.from(exerciseMap.values()),
+    totalPlannedSeconds: stepsTotalSeconds,
+    elapsedSeconds: Math.round(elapsed),
+    completionFraction: completionFraction,
+    completed: completionFraction >= 0.75
+  };
+}
+
+async function logSession(summary){
+  if(!authUser || summary.elapsedSeconds <= 0) return;
+  try{
+    await db.collection('users').doc(authUser.uid).collection('sessions').add({
+      dayName: summary.dayName,
+      exercises: summary.exercises,
+      startedAt: sessionStartStamp || firebase.firestore.FieldValue.serverTimestamp(),
+      finishedAt: firebase.firestore.FieldValue.serverTimestamp(),
+      totalPlannedSeconds: summary.totalPlannedSeconds,
+      elapsedSeconds: summary.elapsedSeconds,
+      completionFraction: summary.completionFraction,
+      completed: summary.completed
+    });
+  }catch(e){ /* Historie ist unterstuetzend, kein User-Feedback noetig */ }
+}
+
 function stopTimer(){
+  logSession(computeSessionSummary(false));
   clearInterval(state.intervalId);
   state.running = false;
   render();
 }
 function finishTimer(){
+  logSession(computeSessionSummary(true));
   clearInterval(state.intervalId);
   state.running = false;
   finishFanfare();
@@ -1421,6 +1576,7 @@ function updateTimerDOM(){
       settings = { theme: null, language: null };
       onboarding = { equipment: [], focus: [], constraints: '', hoursPerWeek: null, completed: false };
       onboardingCardDismissed = false;
+      historySessions = null;
       ensureIds();
       render();
     }

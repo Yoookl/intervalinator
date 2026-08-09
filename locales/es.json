@@ -137,6 +137,12 @@
   "focus.mobility": "Movilidad",
   "focus.general_fitness": "Forma física general",
 
+  "history.title": "Historial",
+  "history.subtitle": "Tus entrenamientos completados de los últimos 30 días",
+  "history.back": "Volver",
+  "history.empty": "Todavía no hay entrenamientos completados en los últimos 30 días.",
+  "history.countBadge": "{count}×",
+
   "timer.pause": "Descanso",
   "timer.warmup": "Calentamiento",
   "timer.stretch": "Estiramiento",

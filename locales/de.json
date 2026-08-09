@@ -137,6 +137,12 @@
   "focus.mobility": "Beweglichkeit",
   "focus.general_fitness": "Allgemeine Fitness",
 
+  "history.title": "Historie",
+  "history.subtitle": "Deine abgeschlossenen Trainings der letzten 30 Tage",
+  "history.back": "Zurück",
+  "history.empty": "Noch keine abgeschlossenen Trainings in den letzten 30 Tagen.",
+  "history.countBadge": "{count}×",
+
   "timer.pause": "Pause",
   "timer.warmup": "Aufwärmen",
   "timer.stretch": "Dehnen",

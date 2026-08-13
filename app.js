@@ -625,7 +625,7 @@ async function loadPlanForCurrentUser(){
 /* ---------- Audio ---------- */
 let audioCtx = null;
 function ensureAudio(){
-  if(!audioCtx){
+  if(!audioCtx || audioCtx.state === 'closed'){
     try{ audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }catch(e){ audioCtx = null; }
   }
 }
@@ -694,11 +694,20 @@ function releaseWakeLock(){
     wakeLockSentinel = null;
   }
 }
+function resumeAudioIfSuspended(){
+  if(audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+}
 document.addEventListener('visibilitychange', () => {
   if(document.visibilityState !== 'visible') return;
-  if(audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+  resumeAudioIfSuspended();
   if(state.running && !wakeLockSentinel) requestWakeLock();
+  // Sofort aufholen statt auf den naechsten (evtl. verzoegerten) Intervall-Tick zu warten,
+  // damit der Timer nach Hintergrund/Sperre nicht "eingefroren" wirkt.
+  if(state.running && !state.paused) tick();
 });
+// iOS setzt AudioContext.resume() aus einem visibilitychange-Handler oft nicht um (keine
+// User-Geste) - beim naechsten Tap nach der Rueckkehr hier zusaetzlich versuchen.
+document.addEventListener('pointerdown', resumeAudioIfSuspended, { passive: true });
 
 /* ---------- Trainings-Sequenz ---------- */
 let steps = [];
@@ -1504,6 +1513,10 @@ function renderExerciseRow(day, ex, exIdx){
 /* ---------- Timer-Ablauf ---------- */
 let sessionStartStamp = null;
 const PREPARE_SECONDS = 10;
+// Deadline (Date.now()-Zeitstempel) statt reinem Sekunden-Runterzaehlen: so kann der
+// Timer beim Zurueckkehren aus dem Hintergrund/nach Bildschirmsperre sofort auf die
+// tatsaechlich vergangene Realzeit aufholen, statt eingefroren zu bleiben.
+let stepDeadline = null;
 
 function startTimer(day){
   ensureAudio();
@@ -1517,6 +1530,7 @@ function startTimer(day){
   state.paused = false;
   state.currentDayName = day.name;
   sessionStartStamp = new Date();
+  stepDeadline = Date.now() + state.remaining*1000;
 
   requestWakeLock();
   beepForMode(steps[0].mode);
@@ -1528,17 +1542,33 @@ function startTimer(day){
 
 function tick(){
   if(state.paused || !state.running) return;
-  state.remaining -= 1;
-  if(state.remaining <= 0){
-    advanceStep();
-  } else {
-    if(state.remaining === 10) tenSecondWarning();
-    if(state.remaining <= 5) countdownBeep(state.remaining);
-    updateTimerDOM();
+  let stepChanged = false;
+  while(state.running){
+    const remaining = Math.round((stepDeadline - Date.now())/1000);
+    if(remaining > 0){
+      state.remaining = remaining;
+      if(stepChanged){
+        beepForMode(steps[state.stepIndex].mode);
+        if(navigator.vibrate) navigator.vibrate(150);
+        render();
+      } else {
+        if(remaining === 10) tenSecondWarning();
+        if(remaining <= 5) countdownBeep(remaining);
+        updateTimerDOM();
+      }
+      return;
+    }
+    state.stepIndex += 1;
+    if(state.stepIndex >= steps.length){
+      finishTimer();
+      return;
+    }
+    stepDeadline += steps[state.stepIndex].seconds*1000;
+    stepChanged = true;
   }
 }
 
-function advanceStep(){
+function skipStep(){
   state.stepIndex += 1;
   if(state.stepIndex >= steps.length){
     finishTimer();
@@ -1546,13 +1576,21 @@ function advanceStep(){
   }
   const s = steps[state.stepIndex];
   state.remaining = s.seconds;
+  stepDeadline = Date.now() + s.seconds*1000;
   beepForMode(s.mode);
   if(navigator.vibrate) navigator.vibrate(150);
   render();
 }
 
-function skipStep(){ advanceStep(); }
-function togglePause(){ state.paused = !state.paused; render(); }
+function togglePause(){
+  if(state.paused){
+    stepDeadline = Date.now() + state.remaining*1000;
+  } else {
+    state.remaining = Math.max(0, Math.round((stepDeadline - Date.now())/1000));
+  }
+  state.paused = !state.paused;
+  render();
+}
 function computeSessionSummary(fullyFinished){
   const completedUpToIndex = fullyFinished ? steps.length : state.stepIndex;
   const elapsed = fullyFinished ? stepsTotalSeconds : elapsedSeconds();

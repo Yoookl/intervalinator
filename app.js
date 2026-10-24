@@ -230,8 +230,8 @@ const DEFAULT_PLAN = {
 
 const state = {
   plan: deepClone(DEFAULT_PLAN),
-  screen: 'main', // 'main' | 'profile'
-  expandedDayIds: new Set(),
+  screen: 'main', // 'main' (Tabs) | 'onboarding' | 'finished'
+  activeDayId: null, // im Training-Tab gewaehlter Tag (null = der faellige)
   running: false,
   stepIndex: 0,
   remaining: 0,
@@ -354,7 +354,13 @@ function showSaveStatus(ok){
 let settings = { theme: null, language: null };
 let settingsSaveTimeout = null;
 
+// 'system' (bzw. kein gespeicherter Wert) folgt der Einstellung des Geraets.
 function applyTheme(theme){
+  if(theme === 'system'){
+    document.documentElement.removeAttribute('data-theme');
+    try{ localStorage.removeItem('intervalinator-theme'); }catch(e){}
+    return;
+  }
   if(theme !== 'light' && theme !== 'dark') return;
   document.documentElement.setAttribute('data-theme', theme);
   try{ localStorage.setItem('intervalinator-theme', theme); }catch(e){}
@@ -560,7 +566,8 @@ async function runGeneration(){
   onboardingGenerating = false;
   persistOnboarding();
   await persistPlan();
-  state.expandedDayIds = new Set();
+  state.activeDayId = null;
+  ui.tab = 'train';
   state.screen = 'main';
   render();
 }
@@ -618,23 +625,73 @@ async function loadPlanForCurrentUser(){
     }
   }
   ensureIds();
-  state.expandedDayIds = new Set();
+  state.activeDayId = null;
   render();
 }
 
 /* ---------- Audio ---------- */
+// Warum so aufwendig: Wenn eine andere App (z.B. Musik) kurz die Audio-Ausgabe uebernimmt, setzt
+// iOS/Safari den AudioContext auf 'interrupted' oder 'suspended'. Ein resume() ohne Nutzergeste
+// wird dann oft ignoriert, und manchmal bleibt der Kontext sogar auf 'running' stehen, ohne dass
+// seine Uhr weiterlaeuft (kein Ton). Zuverlaessig hilft nur: bei der naechsten Beruehrung den
+// Kontext neu anlegen. Solange der Ton blockiert ist, zeigt der Timer einen Hinweis zum Antippen.
 let audioCtx = null;
+let audioClockCheck = null; // { ctxTime, wallTime } - erkennt einen "haengenden" Kontext
+let audioCreatedAt = 0;
+// Frisch angelegt (aus einer Geste) startet der Kontext auf iOS kurz als 'suspended' - so lange nicht als blockiert werten.
+function audioFresh(){ return audioCtx && performance.now() - audioCreatedAt < 1500; }
 function ensureAudio(){
   if(!audioCtx || audioCtx.state === 'closed'){
-    try{ audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }catch(e){ audioCtx = null; }
+    try{
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      audioCreatedAt = performance.now();
+      audioCtx.onstatechange = () => { audioClockCheck = null; if(state.running) updateSoundHint(); };
+    }catch(e){ audioCtx = null; }
+    audioClockCheck = null;
   }
+}
+// true, wenn ein Ton jetzt wirklich zu hoeren waere.
+function audioWorking(){
+  if(audioFresh()) return true;
+  if(!audioCtx || audioCtx.state !== 'running') return false;
+  const now = performance.now();
+  if(!audioClockCheck){ audioClockCheck = { ctxTime: audioCtx.currentTime, wallTime: now }; return true; }
+  const wall = (now - audioClockCheck.wallTime) / 1000;
+  if(wall < 0.5) return audioClockCheck.ok !== false;
+  const ok = audioCtx.currentTime - audioClockCheck.ctxTime > wall * 0.5;
+  audioClockCheck = { ctxTime: audioCtx.currentTime, wallTime: now, ok };
+  return ok;
+}
+// Ohne Nutzergeste (z.B. Seite kommt zurueck in den Vordergrund): nur fortsetzen versuchen.
+function tryResumeAudio(){
+  if(audioCtx && audioCtx.state !== 'running' && audioCtx.state !== 'closed') audioCtx.resume().catch(() => {});
+}
+// In einer Nutzergeste: blockierten Kontext durch einen frischen ersetzen und mit einem stillen Ton freischalten.
+function unlockAudioFromGesture(){
+  if(!state.plan.soundOn) return;
+  if(audioCtx && audioWorking()) return;
+  if(!audioCtx && !state.running) return; // Erster Kontext entsteht beim Trainingsstart (startTimer)
+  if(audioCtx){ try{ audioCtx.close(); }catch(e){} audioCtx = null; }
+  ensureAudio();
+  if(!audioCtx) return;
+  try{
+    const buf = audioCtx.createBuffer(1, 1, 22050);
+    const src = audioCtx.createBufferSource();
+    src.buffer = buf; src.connect(audioCtx.destination); src.start(0);
+  }catch(e){}
+  audioCtx.resume().catch(() => {});
+  if(state.running) setTimeout(updateSoundHint, 300);
 }
 function beep(freq, durationMs, gain){
   if(!state.plan.soundOn) return;
   try{
     ensureAudio();
     if(!audioCtx) return;
-    if(audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+    if(audioCtx.state !== 'running' && !audioFresh()){
+      // Nicht einplanen, solange der Kontext steht - sonst kommen alle Toene gesammelt, sobald er wieder laeuft.
+      tryResumeAudio();
+      return;
+    }
     const vol = (gain != null) ? gain : 0.16;
     const osc = audioCtx.createOscillator();
     const g = audioCtx.createGain();
@@ -694,20 +751,22 @@ function releaseWakeLock(){
     wakeLockSentinel = null;
   }
 }
-function resumeAudioIfSuspended(){
-  if(audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
-}
-document.addEventListener('visibilitychange', () => {
+function onPageVisible(){
   if(document.visibilityState !== 'visible') return;
-  resumeAudioIfSuspended();
+  audioClockCheck = null;
+  tryResumeAudio();
   if(state.running && !wakeLockSentinel) requestWakeLock();
   // Sofort aufholen statt auf den naechsten (evtl. verzoegerten) Intervall-Tick zu warten,
   // damit der Timer nach Hintergrund/Sperre nicht "eingefroren" wirkt.
   if(state.running && !state.paused) tick();
-});
-// iOS setzt AudioContext.resume() aus einem visibilitychange-Handler oft nicht um (keine
-// User-Geste) - beim naechsten Tap nach der Rueckkehr hier zusaetzlich versuchen.
-document.addEventListener('pointerdown', resumeAudioIfSuspended, { passive: true });
+  if(state.running) setTimeout(updateSoundHint, 400);
+}
+document.addEventListener('visibilitychange', onPageVisible);
+window.addEventListener('pageshow', onPageVisible);
+window.addEventListener('focus', onPageVisible);
+// iOS erlaubt Audio nur aus touchend/click heraus (nicht pointerdown/touchstart).
+document.addEventListener('touchend', unlockAudioFromGesture, { passive: true, capture: true });
+document.addEventListener('click', unlockAudioFromGesture, { capture: true });
 
 /* ---------- Trainings-Sequenz ---------- */
 let steps = [];
@@ -721,12 +780,13 @@ function buildSteps(day){
     const sets = Math.max(1, ex.sets || 1);
     const secs = Math.max(1, ex.seconds || 1);
     for(let set=1; set<=sets; set++){
-      s.push({ mode:'exercise', seconds: secs, name: ex.name || '(ohne Namen)', muscle: ex.muscle, exNum: exIdx+1, totalEx: exercises.length, setNum: set, totalSets: sets });
+      s.push({ mode:'exercise', seconds: secs, name: ex.name || t('exercise.unnamed'), muscle: ex.muscle, exIdx, exNum: exIdx+1, totalEx: exercises.length, setNum: set, totalSets: sets });
       const isLastOverall = (exIdx === exercises.length-1) && (set === sets);
       if(!isLastOverall){
         const movingToNextExercise = (set === sets);
         const pauseLen = Math.max(0, movingToNextExercise ? effectivePauseAfter(ex) : effectiveSetPause(ex));
-        s.push({ mode:'pause', seconds: pauseLen });
+        // kind/afterExIdx: damit die Spur im Training weiss, ob Satzpause oder Uebungswechsel ist.
+        s.push({ mode:'pause', seconds: pauseLen, kind: movingToNextExercise ? 'exercise' : 'set', afterExIdx: exIdx });
       }
     }
   });
@@ -756,56 +816,15 @@ function formatMinSec(totalSeconds){
   return `${m}:${String(s).padStart(2,'0')} ${t('common.minutesSuffix')}`;
 }
 
-/* ---------- Modal ---------- */
-// Erstes Overlay/Modal im Code. Wird an document.body gehaengt (nicht #app),
-// da render() bei jedem Aufruf #app.innerHTML leert und ein offenes Modal sonst mitreissen wuerde.
-function openModal(buildContentFn){
-  const overlay = el('div', {class:'modal-overlay'});
-  const box = el('div', {class:'modal-box'});
 
-  function close(){
-    document.removeEventListener('keydown', onKeydown);
-    overlay.remove();
-  }
-  function onKeydown(e){
-    if(e.key === 'Escape') close();
-  }
-  overlay.addEventListener('click', (e) => { if(e.target === overlay) close(); });
-  document.addEventListener('keydown', onKeydown);
+/* ---------- Oberflaeche (Konzept "Timeline") ----------
+   Alle Bildschirme werden als HTML-Strings gebaut und in #app gesetzt.
+   Klicks laufen zentral ueber data-act="<aktion>" (siehe ACTIONS), Texteingaben ueber
+   data-input="<feld>" (siehe INPUTS) - so verliert render() keine halb getippten Eingaben.
+   Alles, was vom Nutzer kommt (Namen, E-Mail), geht durch esc(). */
 
-  box.appendChild(buildContentFn(close));
-  overlay.appendChild(box);
-  document.body.appendChild(overlay);
-  return close;
-}
-
-// Baut ein Zahlenfeld + "an globale Einstellung gekoppelt"-Checkbox fuer das Pause-Modal.
-// initialValue ist immer der aktuell wirksame Wert (ob global oder eigen), damit beim Umschalten
-// des Kopplungs-Status die Zahl nicht "springt".
-function buildPauseFieldGroup(labelText, initialValue, initialLinked, onChange){
-  const wrap = el('div', {class:'modal-field'});
-  wrap.appendChild(el('div', {class:'modal-field-label'}, [labelText]));
-
-  const row = el('div', {class:'modal-field-row'});
-  const input = el('input', {type:'number', min:'0', step:'5'});
-  input.value = initialValue;
-  row.appendChild(input);
-  wrap.appendChild(row);
-
-  const toggleWrap = el('label', {class:'modal-toggle'});
-  const checkbox = el('input', {type:'checkbox'});
-  checkbox.checked = initialLinked;
-  toggleWrap.appendChild(checkbox);
-  toggleWrap.appendChild(el('span', {}, [t('pauseModal.linked')]));
-  wrap.appendChild(toggleWrap);
-
-  function emit(){
-    onChange(checkbox.checked, Math.max(0, parseInt(input.value || '0', 10)));
-  }
-  input.addEventListener('input', emit);
-  checkbox.addEventListener('change', emit);
-
-  return wrap;
+function esc(s){
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
 function effectiveSetPause(ex){
@@ -815,384 +834,744 @@ function effectivePauseAfter(ex){
   return (ex.pauseAfterOverride != null) ? ex.pauseAfterOverride : state.plan.pauseSeconds;
 }
 
-function openPauseSettingsModal(day, ex){
-  openModal((close) => {
-    const wrap = el('div', {});
-    wrap.appendChild(el('div', {class:'modal-title'}, [t('pauseModal.title', {name: ex.name || t('exercise.namePlaceholder')})]));
+const MUSCLE_HUES = { warmup:60, chest:20, back:250, shoulders:205, biceps:290, triceps:320, legs:120, abs:160, fullbody:180, cardio:5, stretch:340, other:260 };
+function muscleColor(m){ return `oklch(var(--m-l) var(--m-c) ${MUSCLE_HUES[m] != null ? MUSCLE_HUES[m] : 260})`; }
 
-    let setPauseLinked = ex.setPauseOverride == null;
-    let setPauseValue = effectiveSetPause(ex);
-    wrap.appendChild(buildPauseFieldGroup(t('pauseModal.setPauseLabel'), setPauseValue, setPauseLinked, (linked, value) => {
-      setPauseLinked = linked; setPauseValue = value;
-    }));
+const ICON_FILL = 'fill="currentColor" stroke="none"';
+const ICONS = {
+  back:'<path d="M15 18l-6-6 6-6"/>', close:'<path d="M6 6l12 12M18 6L6 18"/>', next:'<path d="M9 6l6 6-6 6"/>',
+  chart:'<path d="M5 20V11M12 20V5M19 20v-6"/>', user:'<circle cx="12" cy="8" r="4"/><path d="M4 20c1.5-4 4.5-6 8-6s6.5 2 8 6"/>',
+  list:'<path d="M9 6h11M9 12h11M9 18h11"/><circle cx="4.5" cy="6" r="1" fill="currentColor"/><circle cx="4.5" cy="12" r="1" fill="currentColor"/><circle cx="4.5" cy="18" r="1" fill="currentColor"/>',
+  play:`<path d="M8 5.5v13l10.5-6.5z" ${ICON_FILL}/>`, pause:`<rect x="6.5" y="5" width="4" height="14" rx="1" ${ICON_FILL}/><rect x="13.5" y="5" width="4" height="14" rx="1" ${ICON_FILL}/>`,
+  skip:`<path d="M5.5 5.5v13l9-6.5z" ${ICON_FILL}/><path d="M18 5.5v13"/>`, prev:`<path d="M18.5 5.5v13l-9-6.5z" ${ICON_FILL}/><path d="M6 5.5v13"/>`,
+  plus:'<path d="M12 5v14M5 12h14"/>', minus:'<path d="M5 12h14"/>', check:'<path d="M5 12.5l4.5 4.5L19 7.5"/>',
+  trash:'<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/>', up:'<path d="M6 15l6-6 6 6"/>', down:'<path d="M6 9l6 6 6-6"/>',
+  clock:'<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>', more:`<circle cx="5" cy="12" r="1.8" ${ICON_FILL}/><circle cx="12" cy="12" r="1.8" ${ICON_FILL}/><circle cx="19" cy="12" r="1.8" ${ICON_FILL}/>`,
+  spark:'<path d="M12 3v4M12 17v4M3 12h4M17 12h4M6 6l2.5 2.5M15.5 15.5L18 18M6 18l2.5-2.5M15.5 8.5L18 6"/>',
+  sound:'<path d="M4 9v6h4l5 4V5L8 9z"/><path d="M16.5 8.5a5 5 0 0 1 0 7"/>', logout:'<path d="M15 4h4v16h-4M10 8l-4 4 4 4M6 12h10"/>', search:'<circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4-4"/>', flag:'<path d="M5 21V4M5 4h11l-2 4 2 4H5"/>'
+};
+function icon(name, size){
+  const s = size || 22;
+  return `<svg class="ic" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ''}</svg>`;
+}
 
-    let afterLinked = ex.pauseAfterOverride == null;
-    let afterValue = effectivePauseAfter(ex);
-    wrap.appendChild(buildPauseFieldGroup(t('pauseModal.afterLabel'), afterValue, afterLinked, (linked, value) => {
-      afterLinked = linked; afterValue = value;
-    }));
+const ui = {
+  tab: 'train',        // 'train' | 'history' | 'profile'
+  sheet: null,         // 'editEx' | 'library' | 'day' | 'stop' | 'regen' | 'deleteAccount'
+  editExId: null,
+  libFilter: '',
+  libQuery: '',
+  confirmDeleteDay: false,
+  setupOpen: 0,
+  finished: null,      // { summary, day } nach einem Training
+  pwOpen: false
+};
+const drafts = { email: '', password: '', curPw: '', newPw: '', deletePw: '' };
 
-    const actions = el('div', {class:'modal-actions'});
-    const cancelBtn = el('button', {class:'btn'}, [t('common.cancel')]);
-    cancelBtn.addEventListener('click', close);
-    const saveBtn = el('button', {class:'btn btn-primary'}, [t('common.save')]);
-    saveBtn.addEventListener('click', () => {
-      if(setPauseLinked){ state.plan.setPauseSeconds = setPauseValue; ex.setPauseOverride = null; }
-      else { ex.setPauseOverride = setPauseValue; }
-      if(afterLinked){ state.plan.pauseSeconds = afterValue; ex.pauseAfterOverride = null; }
-      else { ex.pauseAfterOverride = afterValue; }
-      schedulePersist();
-      close();
-      render();
-    });
-    actions.appendChild(cancelBtn);
-    actions.appendChild(saveBtn);
-    wrap.appendChild(actions);
+function activeDay(){
+  const days = state.plan.days;
+  return days.find(d => d.id === state.activeDayId) || dueDay() || days[0] || null;
+}
 
-    return wrap;
-  });
+/* ---------- Abgeleitete Werte aus der Historie ---------- */
+function sessionDate(s){
+  if(!s || !s.finishedAt) return null;
+  if(s.finishedAt.toDate) return s.finishedAt.toDate();
+  return s.finishedAt instanceof Date ? s.finishedAt : null;
+}
+function completedSessions(){
+  return (historySessions || []).filter(s => s.completed && sessionDate(s)).sort((a, b) => sessionDate(b) - sessionDate(a));
+}
+// Rotation: dran ist der Tag nach dem zuletzt abgeschlossenen (Sessions speichern nur den Tagesnamen).
+function dueDay(){
+  const days = state.plan.days;
+  if(!days.length) return null;
+  const last = completedSessions()[0];
+  if(!last) return days[0];
+  const idx = days.findIndex(d => d.name === last.dayName);
+  return days[(idx + 1) % days.length];
+}
+function lastDoneDate(day){
+  const s = completedSessions().find(x => x.dayName === day.name);
+  return s ? sessionDate(s) : null;
+}
+function relDay(date){
+  if(!date) return t('rel.never');
+  const a = new Date(); a.setHours(0,0,0,0);
+  const b = new Date(date); b.setHours(0,0,0,0);
+  const diff = Math.round((a - b) / 86400000);
+  if(diff <= 0) return t('rel.today');
+  if(diff === 1) return t('rel.yesterday');
+  if(diff < 7) return t('rel.daysAgo', {n: diff});
+  return b.toLocaleDateString(currentLanguage, {day:'numeric', month:'numeric'});
+}
+function minutesLabel(sec){ return t('common.minutes', {n: Math.max(1, Math.round(sec / 60))}); }
+function daySets(day){ return day.exercises.reduce((a, e) => a + Math.max(1, e.sets || 1), 0); }
+function doseLabel(ex){
+  if(ex.sets > 1) return `${ex.sets} × ${ex.seconds} s`;
+  return ex.seconds >= 60 ? formatClock(ex.seconds) + ' ' + t('common.minutesSuffix') : `${ex.seconds} s`;
+}
+function weekStart(d){
+  const x = new Date(d || Date.now()); x.setHours(0,0,0,0);
+  x.setDate(x.getDate() - ((x.getDay() + 6) % 7));
+  return x;
+}
+function isoWeek(d){
+  const x = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  const n = x.getUTCDay() || 7; x.setUTCDate(x.getUTCDate() + 4 - n);
+  const y = new Date(Date.UTC(x.getUTCFullYear(), 0, 1));
+  return Math.ceil(((x - y) / 864e5 + 1) / 7);
+}
+function weeklyTarget(){
+  return onboarding.daysPerWeek || state.plan.days.length || 3;
 }
 
 /* ---------- Render ---------- */
 function render(){
   const app = document.getElementById('app');
-  app.innerHTML = '';
-  if(!authReady){
-    app.appendChild(renderLoadingScreen());
-    return;
-  }
-  if(!authUser){
-    app.appendChild(renderAuthScreen());
-    return;
-  }
-  if(state.running){
-    app.appendChild(renderTimerScreen());
-    return;
-  }
-  if(state.screen === 'profile'){
-    app.appendChild(renderProfileScreen());
-    return;
-  }
-  if(state.screen === 'onboarding'){
-    app.appendChild(renderOnboardingScreen());
-    return;
-  }
-  if(state.screen === 'history'){
-    app.appendChild(renderHistoryScreen());
-    return;
-  }
-  app.appendChild(renderMainView());
-}
+  const sc = app.querySelector('.screen');
+  const keepScroll = render.keepScroll && sc ? sc.scrollTop : null;
+  render.keepScroll = false;
 
-function renderLoadingScreen(){
-  const wrap = el('div', {class:'auth-wrap'});
-  wrap.appendChild(el('div', {class:'auth-sub'}, [t('common.loading')]));
-  return wrap;
-}
+  let html;
+  if(!authReady) html = `<div class="center-screen"><div class="muted">${esc(t('common.loading'))}</div></div>`;
+  else if(!authUser) html = vAuth();
+  else if(state.running) html = vRun();
+  else if(state.screen === 'finished' && ui.finished) html = vFinished();
+  else if(state.screen === 'onboarding') html = vSetup();
+  else html = vTabs();
+  app.innerHTML = html + vSheet();
 
-function renderAuthScreen(){
-  const wrap = el('div', {class:'auth-wrap'});
-  const card = el('div', {class:'auth-card'});
+  if(state.running){ updateTimerDOM(); scrollRunTrack(); }
+  if(keepScroll != null){ const n = app.querySelector('.screen'); if(n) n.scrollTop = keepScroll; }
+}
+// Neu zeichnen, ohne dass die Liste nach oben springt (z.B. nach + / - im Sheet).
+function rerender(){ render.keepScroll = true; render(); }
+
+/* ---------- Anmeldung ---------- */
+function vAuth(){
   const isLogin = authMode === 'login';
-  card.appendChild(el('div', {class:'auth-title'}, [t('auth.title')]));
-  card.appendChild(el('div', {class:'auth-sub'}, [isLogin ? t('auth.loginSubtitle') : t('auth.registerSubtitle')]));
+  return `
+  <div class="screen auth-screen">
+    <div class="auth-brand"><span class="brand-mark">${icon('clock', 26)}</span><span>Intervalinator</span></div>
+    <div class="auth-card">
+      <h1 class="display">${esc(isLogin ? t('auth.loginSubtitle') : t('auth.registerSubtitle'))}</h1>
+      ${authError ? `<div class="msg msg-error">${esc(authError)}</div>` : ''}
+      ${authInfo ? `<div class="msg msg-info">${esc(authInfo)}</div>` : ''}
+      <label class="field"><span>${esc(t('auth.email'))}</span>
+        <input type="email" id="authEmail" autocomplete="email" data-input="email" data-enter="authSubmit" value="${esc(drafts.email)}"></label>
+      <label class="field"><span>${esc(t('auth.password'))}</span>
+        <input type="password" id="authPassword" autocomplete="${isLogin ? 'current-password' : 'new-password'}" data-input="password" data-enter="authSubmit" value="${esc(drafts.password)}">
+        ${isLogin ? '' : `<small>${esc(t('auth.passwordHint'))}</small>`}</label>
+      <button class="btn btn-primary" data-act="authSubmit" ${authBusy ? 'disabled' : ''}>${esc(authBusy ? t('auth.submitting') : (isLogin ? t('auth.loginButton') : t('auth.registerButton')))}</button>
+      ${isLogin ? `<button class="link" data-act="resetPassword">${esc(t('auth.forgotPassword'))}</button>` : ''}
+    </div>
+    <button class="link" data-act="authSwitch">${esc(isLogin ? t('auth.switchToRegister') : t('auth.switchToLogin'))}</button>
+  </div>`;
+}
 
-  if(authError) card.appendChild(el('div', {class:'auth-error'}, [authError]));
-  if(authInfo) card.appendChild(el('div', {class:'auth-info'}, [authInfo]));
+/* ---------- Tabs ---------- */
+function vTabs(){
+  const body = ui.tab === 'history' ? vHistory() : ui.tab === 'profile' ? vProfile() : vTrain();
+  const tab = (id, ic, label) => `<button class="${ui.tab === id ? 'on' : ''}" data-act="tab" data-arg="${id}" ${ui.tab === id ? 'aria-current="page"' : ''}>${icon(ic)}<span>${esc(label)}</span></button>`;
+  return body + `<nav class="tabbar">${tab('train', 'list', t('nav.train'))}${tab('history', 'chart', t('nav.progress'))}${tab('profile', 'user', t('nav.profile'))}</nav>`;
+}
 
-  const emailField = el('div', {class:'auth-field'});
-  emailField.appendChild(el('label', {}, [t('auth.email')]));
-  const emailInput = el('input', {type:'email', autocomplete:'email'});
-  emailField.appendChild(emailInput);
+/* ---------- Training: Tage + kompakte Spur ---------- */
+function vTrain(){
+  const days = state.plan.days;
+  if(!days.length){
+    return `
+    <header class="head"><h1 class="display">${esc(t('train.title'))}</h1></header>
+    <div class="screen">
+      <div class="empty">
+        <span class="empty-icon">${icon('spark', 28)}</span>
+        <h2>${esc(t('train.emptyTitle'))}</h2>
+        <p>${esc(t('train.emptyText'))}</p>
+        <button class="btn btn-primary" data-act="openSetup">${esc(t('train.emptyGenerate'))}</button>
+        <button class="btn btn-ghost" data-act="addDay">${esc(t('train.emptyManual'))}</button>
+      </div>
+    </div>`;
+  }
+  const d = activeDay(), due = dueDay();
+  const total = dayTotalSeconds(d);
+  return `
+  <header class="head"><h1 class="display">${esc(t('train.title'))}</h1></header>
+  <div class="days" role="tablist" aria-label="${esc(t('train.daysLabel'))}">
+    ${days.map(x => `
+      <button class="day-chip ${x.id === d.id ? 'on' : ''}" role="tab" aria-selected="${x.id === d.id}" data-act="pickDay" data-arg="${x.id}">
+        ${due && x.id === due.id ? `<span class="due">${esc(t('train.due'))}</span>` : ''}
+        <b>${esc(x.name || t('main.newDayName'))}</b><span>${esc(minutesLabel(dayTotalSeconds(x)))}</span>
+      </button>`).join('')}
+    <button class="day-chip add" data-act="addDay" aria-label="${esc(t('train.addDay'))}">${icon('plus')}</button>
+  </div>
+  <div class="screen">
+    ${!onboarding.completed && !onboardingCardDismissed ? `
+      <div class="hint-card">
+        <b>${esc(t('onboarding.introTitle'))}</b>
+        <p>${esc(t('onboarding.introText'))}</p>
+        <div class="row-btns"><button class="btn btn-small btn-ghost" data-act="dismissIntro">${esc(t('onboarding.introSkip'))}</button><button class="btn btn-small btn-primary" data-act="openSetup">${esc(t('onboarding.introStart'))}</button></div>
+      </div>` : ''}
+    <div class="summary">
+      <span><b>${d.exercises.length}</b> ${esc(t('train.exercises'))}</span>
+      <span><b>${daySets(d)}</b> ${esc(t('train.sets'))}</span>
+      <span>${esc(t('train.lastDone'))} <b>${esc(relDay(lastDoneDate(d)))}</b></span>
+      <button class="icon-btn small" data-act="openDaySheet" aria-label="${esc(t('train.dayOptions'))}">${icon('more', 20)}</button>
+    </div>
+    ${d.exercises.length ? `<div class="cap">${esc(t('train.flowHint'))}</div>${vTrack(d, null)}` : `<div class="muted pad">${esc(t('day.noExercisesYet'))}</div>`}
+    <button class="add-btn" data-act="openLibrary">${icon('plus', 18)} ${esc(t('train.addExercise'))}</button>
+  </div>
+  <div class="startbar">
+    <button class="btn btn-primary btn-start" data-act="start" ${d.exercises.length ? '' : 'disabled'}>${icon('play', 22)} ${esc(t('train.start', {name: d.name}))} <small>· ${esc(minutesLabel(total))}</small></button>
+  </div>`;
+}
 
-  const pwField = el('div', {class:'auth-field'});
-  pwField.appendChild(el('label', {}, [t('auth.password')]));
-  const pwInput = el('input', {type:'password', autocomplete: isLogin ? 'current-password' : 'new-password'});
-  pwField.appendChild(pwInput);
-  if(!isLogin) pwField.appendChild(el('div', {class:'auth-hint'}, [t('auth.passwordHint')]));
+/* Kompakte Spur: eine Zeile pro Uebung, dazwischen die Pause.
+   pos (nur im Training) = { exIdx, set, setDone, restAfter, all } markiert, wo man gerade steht. */
+function vTrack(d, pos){
+  const live = !!pos;
+  return `<ol class="track ${live ? 'live' : ''}">${d.exercises.map((ex, i) => {
+    let st = '';
+    if(pos){ if(pos.all || i < pos.exIdx) st = 'done'; else if(i === pos.exIdx && pos.restAfter == null) st = 'cur'; }
+    const sets = Math.max(1, ex.sets || 1);
+    const pills = st === 'cur' ? `<span class="pills">${Array.from({length: sets}, (_, k) => {
+      const done = k + 1 < pos.set || (k + 1 === pos.set && pos.setDone);
+      return `<i class="${done ? 'done' : ''}">${k + 1 === pos.set && !pos.setDone ? '<b id="livePill"></b>' : ''}</i>`;
+    }).join('')}</span>` : '';
+    const setPause = sets > 1 ? `${t('ex.setPauseShort', {s: effectiveSetPause(ex)})}${ex.setPauseOverride != null ? ' · ' + t('ex.custom') : ''}` : '';
+    const row = `<li class="ex ${st}" ${st === 'cur' ? 'id="curEx"' : ''}>
+      <button class="ex-btn" ${live ? 'tabindex="-1"' : `data-act="editEx" data-arg="${ex.id}"`}>
+        <span class="node">${st === 'done' ? icon('check', 13) : i + 1}</span>
+        <span class="ex-main">
+          <span class="ex-name">${esc(ex.name || t('exercise.namePlaceholder'))}</span>
+          <span class="ex-sub"><i style="background:${muscleColor(ex.muscle)}"></i>${esc(t('muscle.' + ex.muscle))}${setPause ? ' · ' + esc(setPause) : ''}</span>
+          ${pills}
+        </span>
+        <span class="ex-dose">${esc(doseLabel(ex))}</span>
+      </button>
+    </li>`;
+    if(i === d.exercises.length - 1) return row;
+    const isRest = pos && pos.restAfter === i;
+    const gap = `<li class="gap ${isRest ? 'cur' : ''} ${pos && (pos.all || i < (pos.restAfter != null ? pos.restAfter : pos.exIdx)) ? 'done' : ''}">
+      <button ${live ? 'tabindex="-1"' : `data-act="editEx" data-arg="${ex.id}"`}>${icon('clock', 13)} ${esc(isRest ? t('track.restNow', {s: effectivePauseAfter(ex)}) : t('track.rest', {s: effectivePauseAfter(ex)}))}${ex.pauseAfterOverride != null ? ' · ' + esc(t('ex.custom')) : ''}</button>
+    </li>`;
+    return row + gap;
+  }).join('')}</ol>`;
+}
 
-  card.appendChild(emailField);
-  card.appendChild(pwField);
+/* ---------- Verlauf (Statistik) ---------- */
+function ringSvg(frac, size, stroke, color){
+  const r = (size - stroke) / 2, C = 2 * Math.PI * r, c = size / 2;
+  return `<svg viewBox="0 0 ${size} ${size}" width="${size}" height="${size}" aria-hidden="true">
+    <circle cx="${c}" cy="${c}" r="${r}" fill="none" stroke="var(--sunk)" stroke-width="${stroke}"/>
+    <circle cx="${c}" cy="${c}" r="${r}" fill="none" stroke="${color}" stroke-width="${stroke}" stroke-linecap="round"
+      stroke-dasharray="${C}" stroke-dashoffset="${C * (1 - Math.min(1, frac))}" transform="rotate(-90 ${c} ${c})"/></svg>`;
+}
+function vHistory(){
+  const head = `<header class="head"><div><div class="eyebrow">${esc(t('stats.eyebrow'))}</div><h1 class="display">${esc(t('stats.title'))}</h1></div></header>`;
+  if(historySessions === null || historyLoading) return head + `<div class="screen"><div class="muted pad">${esc(t('common.loading'))}</div></div>`;
+  const done = completedSessions();
+  const target = weeklyTarget();
+  const ws = weekStart();
+  const weeks = [3,2,1,0].map(k => {
+    const from = new Date(ws); from.setDate(from.getDate() - 7 * k);
+    const to = new Date(from); to.setDate(to.getDate() + 7);
+    return { from, n: done.filter(s => sessionDate(s) >= from && sessionDate(s) < to).length, now: k === 0 };
+  });
+  const since30 = new Date(Date.now() - 30 * 864e5);
+  const last30 = done.filter(s => sessionDate(s) >= since30);
+  const minutes = last30.reduce((a, s) => a + (s.elapsedSeconds || 0), 0) / 60;
+  const sets = last30.reduce((a, s) => a + (s.exercises || []).reduce((b, e) => b + (e.reachedSets || 0), 0), 0);
+  return head + `
+  <div class="screen">
+    ${historyError ? `<div class="msg msg-error">${esc(historyError)}</div>` : ''}
+    <section class="weeks" aria-label="${esc(t('stats.weeksLabel'))}">
+      ${weeks.map(w => `<div class="wk ${w.now ? 'current' : ''}">${ringSvg(w.n / target, 64, 8, w.n >= target ? 'var(--ok)' : 'var(--accent)')}
+        <b>${w.n}/${target}</b><span>${esc(w.now ? t('stats.thisWeek') : t('stats.week', {n: isoWeek(w.from)}))}</span></div>`).join('')}
+    </section>
+    <section class="kpis">
+      <div class="kpi"><b>${last30.length}</b><span>${esc(t('stats.sessions30'))}</span></div>
+      <div class="kpi"><b>${(minutes / 60).toFixed(1).replace('.', currentLanguage === 'en' ? '.' : ',')} h</b><span>${esc(t('stats.time30'))}</span></div>
+      <div class="kpi"><b>${sets}</b><span>${esc(t('stats.sets30'))}</span></div>
+      <div class="kpi"><b>${weeks.filter(w => w.n >= target).length}/4</b><span>${esc(t('stats.weeksOnTarget'))}</span></div>
+    </section>
+    <div class="cap">${esc(t('stats.recent'))}</div>
+    ${done.length ? `<ul class="list">${done.slice(0, 12).map(s => {
+      const d = sessionDate(s);
+      return `<li class="list-row"><div class="grow"><b>${esc(s.dayName || '')}</b><small>${esc(d.toLocaleDateString(currentLanguage, {weekday:'long', day:'numeric', month:'numeric'}))}</small></div>
+        <span class="num">${esc(minutesLabel(s.elapsedSeconds || 0))}</span></li>`; }).join('')}</ul>`
+      : `<div class="muted pad">${esc(t('history.empty'))}</div>`}
+  </div>`;
+}
 
-  const submitBtn = el('button', {class:'btn btn-primary btn-block'}, [authBusy ? t('auth.submitting') : (isLogin ? t('auth.loginButton') : t('auth.registerButton'))]);
-  submitBtn.disabled = authBusy;
-  submitBtn.addEventListener('click', () => {
-    const email = emailInput.value.trim();
-    const pw = pwInput.value;
+/* ---------- Profil ---------- */
+const LANGUAGE_NAMES = { de: 'Deutsch', en: 'English', fr: 'Français', es: 'Español' };
+function vStepper(act, value, unit){
+  return `<div class="stepper"><button data-act="${act}" data-arg="-5" aria-label="${esc(t('common.less'))}">${icon('minus', 16)}</button><output>${value}${unit || ''}</output><button data-act="${act}" data-arg="5" aria-label="${esc(t('common.more'))}">${icon('plus', 16)}</button></div>`;
+}
+function vProfile(){
+  const theme = settings.theme === 'light' || settings.theme === 'dark' ? settings.theme : 'system';
+  return `
+  <header class="head"><div><div class="eyebrow">${esc(authUser.email || '')}</div><h1 class="display">${esc(t('profile.title'))}</h1></div>
+    <button class="icon-btn" data-act="logout" aria-label="${esc(t('main.logout'))}" title="${esc(t('main.logout'))}">${icon('logout', 20)}</button></header>
+  <div class="screen">
+    ${profileError ? `<div class="msg msg-error">${esc(profileError)}</div>` : ''}
+    ${profileInfo ? `<div class="msg msg-info">${esc(profileInfo)}</div>` : ''}
+    <div class="cap">${esc(t('profile.trainingDefaults'))}</div>
+    <ul class="list">
+      <li class="list-row"><div class="grow"><b>${esc(t('profile.setPause'))}</b><small>${esc(t('profile.setPauseHint'))}</small></div>${vStepper('globalSetPause', state.plan.setPauseSeconds, ' s')}</li>
+      <li class="list-row"><div class="grow"><b>${esc(t('profile.exercisePause'))}</b><small>${esc(t('profile.exercisePauseHint'))}</small></div>${vStepper('globalPause', state.plan.pauseSeconds, ' s')}</li>
+      <li class="list-row"><div class="grow"><b>${esc(t('main.soundLabel'))}</b><small>${esc(t('profile.soundHint'))}</small></div>
+        <button class="switch ${state.plan.soundOn ? 'on' : ''}" role="switch" aria-checked="${!!state.plan.soundOn}" data-act="toggleSound" aria-label="${esc(t('main.soundLabel'))}"></button></li>
+      <li><button class="list-row" data-act="openSetup"><div class="grow"><b>${esc(t('onboarding.editLink'))}</b><small>${esc(t('profile.setupHint'))}</small></div>${icon('next', 18)}</button></li>
+    </ul>
+    <div class="cap">${esc(t('profile.appearance'))}</div>
+    <ul class="list">
+      <li class="list-row"><div class="grow"><b>${esc(t('profile.theme'))}</b></div>
+        <div class="seg small">${['system','light','dark'].map(x => `<button class="${theme === x ? 'on' : ''}" data-act="setTheme" data-arg="${x}">${esc(t('profile.theme_' + x))}</button>`).join('')}</div></li>
+      <li class="list-row"><div class="grow"><b>${esc(t('profile.language'))}</b></div>
+        <select id="langSelect" data-change="language">${SUPPORTED_LANGUAGES.map(l => `<option value="${l}" ${l === currentLanguage ? 'selected' : ''}>${LANGUAGE_NAMES[l]}</option>`).join('')}</select></li>
+    </ul>
+    <div class="cap">${esc(t('profile.account'))}</div>
+    <ul class="list">
+      <li><button class="list-row" data-act="togglePw" aria-expanded="${ui.pwOpen}"><div class="grow"><b>${esc(t('profile.changePasswordTitle'))}</b></div>${icon(ui.pwOpen ? 'up' : 'down', 18)}</button>
+        ${ui.pwOpen ? `<div class="list-body">
+          <label class="field"><span>${esc(t('profile.currentPassword'))}</span><input type="password" id="curPw" autocomplete="current-password" data-input="curPw" value="${esc(drafts.curPw)}"></label>
+          <label class="field"><span>${esc(t('profile.newPassword'))}</span><input type="password" id="newPw" autocomplete="new-password" data-input="newPw" value="${esc(drafts.newPw)}"><small>${esc(t('auth.passwordHint'))}</small></label>
+          <button class="btn btn-ghost" data-act="changePassword">${esc(t('profile.changePasswordButton'))}</button></div>` : ''}</li>
+      <li><button class="list-row danger" data-act="openDeleteAccount"><div class="grow"><b>${esc(t('profile.deleteAccountButton'))}</b><small>${esc(t('profile.deleteAccountWarning'))}</small></div></button></li>
+    </ul>
+  </div>`;
+}
+
+/* ---------- Trainingsziele / Plan-Generator: Abschnitte nacheinander ---------- */
+function vSetup(){
+  const open = ui.setupOpen;
+  const eqLabel = onboarding.equipment.length ? onboarding.equipment.map(id => t('equipment.' + id)).join(', ') : t('setup.nothingChosen');
+  const focusLabel = onboarding.focus.length ? onboarding.focus.map(id => t('focus.' + id)).join(', ') : t('setup.nothingChosen');
+  const timeLabel = t('setup.timeSummary', {days: onboarding.daysPerWeek || '–', minutes: onboarding.sessionMinutes || '–'});
+  const sections = [
+    { title: t('onboarding.equipment'), summary: eqLabel, body: () => `
+      <div class="chips">${EQUIPMENT_IDS.map(id => `<button class="chip ${onboarding.equipment.includes(id) ? 'on' : ''}" data-act="toggleEquipment" data-arg="${id}" aria-pressed="${onboarding.equipment.includes(id)}">${esc(t('equipment.' + id))}</button>`).join('')}</div>` },
+    { title: t('onboarding.focus'), summary: focusLabel, body: () => `
+      <div class="chips">${FOCUS_IDS.map(id => `<button class="chip ${onboarding.focus.includes(id) ? 'on' : ''}" data-act="toggleFocus" data-arg="${id}" aria-pressed="${onboarding.focus.includes(id)}">${esc(t('focus.' + id))}</button>`).join('')}</div>` },
+    { title: t('setup.time'), summary: timeLabel, body: () => `
+      <div class="mini-label">${esc(t('onboarding.daysPerWeek'))}</div>
+      <div class="seg">${[1,2,3,4,5,6,7].map(n => `<button class="${onboarding.daysPerWeek === n ? 'on' : ''}" data-act="setDays" data-arg="${n}">${n}</button>`).join('')}</div>
+      <div class="mini-label">${esc(t('onboarding.sessionMinutes'))}</div>
+      <div class="seg">${[20,30,45,60,75,90].map(n => `<button class="${onboarding.sessionMinutes === n ? 'on' : ''}" data-act="setMinutes" data-arg="${n}">${n}</button>`).join('')}</div>` },
+    { title: t('onboarding.constraints'), summary: onboarding.constraints || t('setup.none'), body: () => `
+      <input type="text" id="constraints" data-input="constraints" placeholder="${esc(t('onboarding.constraintsPlaceholder'))}" value="${esc(onboarding.constraints || '')}">` }
+  ];
+  return `
+  <header class="head"><button class="icon-btn" data-act="closeSetup" aria-label="${esc(t('onboarding.back'))}">${icon('close')}</button>
+    <h1 class="display center">${esc(t('onboarding.title'))}</h1><span class="icon-spacer"></span></header>
+  <div class="screen">
+    <p class="muted">${esc(t('onboarding.intro'))}</p>
+    <div class="cap">${esc(t('setup.progress', {n: Math.min(open + 1, sections.length), total: sections.length}))}</div>
+    <ol class="acc">${sections.map((s, i) => {
+      const cls = i < open ? 'done' : i === open ? 'open' : '';
+      return `<li class="sec ${cls}">
+        <button class="sec-head" data-act="openSection" data-arg="${i}" aria-expanded="${i === open}">
+          <span class="sec-num">${i < open ? icon('check', 14) : i + 1}</span>
+          <span class="grow"><b>${esc(s.title)}</b>${i !== open ? `<small>${esc(s.summary)}</small>` : ''}</span>
+          ${i < open ? `<span class="muted small">${esc(t('setup.change'))}</span>` : ''}
+        </button>
+        ${i === open ? `<div class="sec-body">${s.body()}
+          ${i < sections.length - 1 ? `<button class="btn btn-small btn-primary" data-act="openSection" data-arg="${i + 1}">${esc(t('setup.continueTo', {name: sections[i + 1].title}))}</button>` : ''}</div>` : ''}
+      </li>`; }).join('')}
+    </ol>
+    ${onboardingGenerateError ? `<div class="msg msg-error">${esc(onboardingGenerateError)}</div>` : ''}
+  </div>
+  <div class="startbar stack">
+    <button class="btn btn-primary" data-act="generate" ${onboardingGenerating ? 'disabled' : ''}>${icon('spark', 20)} ${esc(onboardingGenerating ? t('onboarding.generating') : t(onboarding.completed && state.plan.days.length ? 'onboarding.regenerateButton' : 'onboarding.generateButton'))}</button>
+    <button class="btn btn-ghost" data-act="saveOnboardingOnly" ${onboardingGenerating ? 'disabled' : ''}>${esc(t('onboarding.saveOnlyButton'))}</button>
+  </div>`;
+}
+
+/* ---------- Training laeuft ---------- */
+function remainingPrecise(){
+  if(state.paused) return pausedRemainingMs / 1000;
+  return Math.max(0, (stepDeadline - Date.now()) / 1000);
+}
+function runPos(){
+  const s = steps[state.stepIndex];
+  if(s.mode === 'exercise') return { exIdx: s.exIdx, set: s.setNum };
+  if(s.mode === 'pause'){
+    if(s.kind === 'exercise') return { exIdx: s.afterExIdx + 1, set: 1, restAfter: s.afterExIdx };
+    const prev = steps[state.stepIndex - 1];
+    return { exIdx: s.afterExIdx, set: prev ? prev.setNum : 1, setDone: true };
+  }
+  return { exIdx: 0, set: 1 };
+}
+function nextExerciseStep(fromIndex){
+  for(let i = fromIndex + 1; i < steps.length; i++) if(steps[i].mode === 'exercise') return steps[i];
+  return null;
+}
+function vRun(){
+  const s = steps[state.stepIndex];
+  const nxt = nextExerciseStep(state.stepIndex);
+  const after = steps[state.stepIndex + 1];
+  let phase, what, mode;
+  if(s.mode === 'exercise'){
+    mode = 'work';
+    phase = t('timer.setOf', {set: s.setNum, total: s.totalSets});
+    const afterTxt = after ? t('timer.thenPause', {s: after.seconds}) : t('timer.thenDone');
+    what = `${esc(s.name)}<small>${esc(t('muscle.' + s.muscle))} · ${esc(afterTxt)}</small>`;
+  } else if(s.mode === 'pause'){
+    mode = 'rest';
+    phase = s.kind === 'exercise' ? t('timer.exerciseChange') : t('timer.setPause');
+    what = nxt ? `${esc(t('timer.upNext', {name: nxt.name}))}<small>${esc(t('timer.setOf', {set: nxt.setNum, total: nxt.totalSets}))} · ${nxt.seconds} s</small>` : '';
+  } else {
+    mode = 'prepare';
+    phase = t('timer.prepare');
+    what = nxt ? `${esc(t('timer.upNext', {name: nxt.name}))}<small>${esc(t('timer.setOf', {set: 1, total: nxt.totalSets}))}</small>` : '';
+  }
+  return `
+  <div class="run ${mode}">
+    <header class="head">
+      <button class="icon-btn" data-act="askStop" aria-label="${esc(t('timer.cancelBtn'))}">${icon('close')}</button>
+      <h1 class="display center small">${esc(state.currentDayName)}</h1>
+      <span class="step-count">${state.stepIndex + 1}/${steps.length}</span>
+    </header>
+    <section class="now" aria-live="polite">
+      <div class="phase"><i></i>${esc(phase)}${state.paused ? ' · ' + esc(t('timer.paused')) : ''}</div>
+      <div class="clock" id="runClock">${formatClock(Math.ceil(remainingPrecise()))}</div>
+      <div class="what">${what}</div>
+      <div class="bar"><i id="runBar"></i></div>
+      <div class="totals"><span id="runElapsed"></span><span id="runLeft"></span></div>
+    </section>
+    <button class="sound-hint" id="soundHint" data-act="enableSound" hidden>${icon('sound', 18)} ${esc(t('timer.soundBlocked'))}</button>
+    <div class="screen run-track" id="runTrack">${vTrack(runDay, runPos())}</div>
+    <div class="controls">
+      <button data-act="prevStep" aria-label="${esc(t('timer.prevBtn'))}">${icon('prev')}</button>
+      <button class="main" data-act="togglePause" aria-label="${esc(state.paused ? t('timer.resumeBtn') : t('timer.pauseBtn'))}">${icon(state.paused ? 'play' : 'pause', 28)}</button>
+      <button data-act="skipStep" aria-label="${esc(t('timer.skipBtn'))}">${icon('skip')}</button>
+    </div>
+  </div>`;
+}
+function updateSoundHint(){
+  const hint = document.getElementById('soundHint');
+  if(hint) hint.hidden = !(state.running && state.plan.soundOn && !audioWorking());
+}
+function updateTimerDOM(){
+  const clk = document.getElementById('runClock');
+  if(!clk || !state.running) return;
+  updateSoundHint();
+  const s = steps[state.stepIndex];
+  const rem = remainingPrecise();
+  clk.textContent = formatClock(Math.ceil(rem));
+  const elapsed = stepStartOffsets[state.stepIndex] + (s.seconds - rem);
+  document.getElementById('runBar').style.width = (elapsed / Math.max(1, stepsTotalSeconds) * 100) + '%';
+  document.getElementById('runElapsed').textContent = t('timer.elapsed', {time: formatClock(elapsed)});
+  document.getElementById('runLeft').textContent = t('timer.left', {time: formatClock(stepsTotalSeconds - elapsed)});
+  const pill = document.getElementById('livePill');
+  if(pill && s.mode === 'exercise') pill.style.width = ((1 - rem / Math.max(1, s.seconds)) * 100) + '%';
+}
+function scrollRunTrack(){
+  const track = document.getElementById('runTrack');
+  const cur = document.getElementById('curEx') || (track && track.querySelector('.gap.cur'));
+  if(track && cur) track.scrollTop = Math.max(0, cur.offsetTop - track.offsetTop - 12);
+}
+
+/* ---------- Nach dem Training ---------- */
+function vFinished(){
+  const { summary, day } = ui.finished;
+  const full = summary.completionFraction >= 0.999;
+  const reached = summary.exercises.reduce((a, e) => a + e.reachedSets, 0);
+  const planned = daySets(day);
+  const next = dueDay();
+  const firstOpen = summary.exercises.findIndex(e => e.reachedSets < e.totalSets);
+  const pos = full ? { all: true, exIdx: 0, set: 1 } : { exIdx: firstOpen < 0 ? summary.exercises.length : firstOpen, set: 1 };
+  return `
+  <header class="head"><span class="icon-spacer"></span><span class="grow"></span><button class="icon-btn" data-act="closeFinished" aria-label="${esc(t('finished.back'))}">${icon('close')}</button></header>
+  <div class="screen">
+    <div class="done-hero">
+      <div class="eyebrow ${summary.completed ? 'ok' : ''}">${esc(summary.completed ? t('finished.complete') : t('finished.partial'))}</div>
+      <h1 class="display big">${esc(summary.completed ? t('finished.title2', {day: summary.dayName}) : t('finished.stopped'))}</h1>
+      <p>${esc(t('finished.stats', {time: formatClock(summary.elapsedSeconds), done: reached, total: planned}))}${next ? ' · ' + esc(t('finished.next', {name: next.name})) : ''}</p>
+    </div>
+    ${vTrack(day, pos)}
+  </div>
+  <div class="startbar"><button class="btn btn-ghost" data-act="closeFinished">${esc(t('finished.back'))}</button></div>`;
+}
+
+/* ---------- Bottom-Sheets ---------- */
+function vSheet(){
+  if(!ui.sheet) return '';
+  const wrap = (inner, closeAct) => `<div class="sheet-backdrop" data-act="${closeAct || 'closeSheet'}"><div class="sheet" role="dialog" aria-modal="true" data-stop><div class="grab"></div>${inner}</div></div>`;
+  const d = activeDay();
+
+  if(ui.sheet === 'editEx'){
+    const i = d ? d.exercises.findIndex(e => e.id === ui.editExId) : -1;
+    const ex = i >= 0 ? d.exercises[i] : null;
+    if(!ex) return '';
+    const pauseRow = (label, hint, value, isCustom, act, resetAct) => `
+      <div class="pause-row">
+        <div class="grow"><b>${esc(label)}</b><small>${esc(hint)}</small></div>
+        ${vStepper(act, value, ' s')}
+        <button class="chip small ${isCustom ? '' : 'on'}" data-act="${resetAct}" aria-pressed="${!isCustom}">${esc(t('ex.default'))}</button>
+      </div>`;
+    return wrap(`
+      <div class="cap">${esc(t('ex.position', {n: i + 1, total: d.exercises.length}))}</div>
+      <input class="name-input" type="text" id="exName" data-input="exName" placeholder="${esc(t('exercise.namePlaceholder'))}" value="${esc(ex.name)}">
+      <div class="chips scroll-x">${MUSCLE_GROUP_IDS.map(m => `<button class="chip ${ex.muscle === m ? 'on' : ''}" data-act="exMuscle" data-arg="${m}"><i class="dot" style="background:${muscleColor(m)}"></i>${esc(t('muscle.' + m))}</button>`).join('')}</div>
+      <div class="big-steppers">
+        <div class="bs"><span class="cap">${esc(t('exercise.sets'))}</span><output>${ex.sets}</output>
+          <div class="bs-btns"><button data-act="exSets" data-arg="-1" aria-label="${esc(t('common.less'))}">${icon('minus')}</button><button data-act="exSets" data-arg="1" aria-label="${esc(t('common.more'))}">${icon('plus')}</button></div></div>
+        <div class="bs"><span class="cap">${esc(t('exercise.secondsPerSet'))}</span><output>${ex.seconds}</output>
+          <div class="bs-btns"><button data-act="exSeconds" data-arg="-5" aria-label="${esc(t('common.less'))}">${icon('minus')}</button><button data-act="exSeconds" data-arg="5" aria-label="${esc(t('common.more'))}">${icon('plus')}</button></div></div>
+      </div>
+      <div class="pauses">
+        ${pauseRow(t('ex.setPauseLabel'), ex.setPauseOverride != null ? t('ex.customHint') : t('ex.defaultHint', {s: state.plan.setPauseSeconds}), effectiveSetPause(ex), ex.setPauseOverride != null, 'exSetPause', 'exSetPauseDefault')}
+        ${i < d.exercises.length - 1 ? pauseRow(t('ex.pauseAfterLabel'), ex.pauseAfterOverride != null ? t('ex.customHint') : t('ex.defaultHint', {s: state.plan.pauseSeconds}), effectivePauseAfter(ex), ex.pauseAfterOverride != null, 'exPauseAfter', 'exPauseAfterDefault') : ''}
+      </div>
+      <div class="tools">
+        <button data-act="exMove" data-arg="-1" ${i === 0 ? 'disabled' : ''}>${icon('up', 18)} ${esc(t('ex.earlier'))}</button>
+        <button data-act="exMove" data-arg="1" ${i === d.exercises.length - 1 ? 'disabled' : ''}>${icon('down', 18)} ${esc(t('ex.later'))}</button>
+        <button class="danger" data-act="exRemove">${icon('trash', 18)} ${esc(t('ex.remove'))}</button>
+      </div>
+      <button class="btn btn-primary" data-act="closeSheet">${esc(t('common.done'))}</button>`);
+  }
+
+  if(ui.sheet === 'library'){
+    return wrap(`
+      <h2 class="display sheet-title">${esc(t('library.title'))}</h2>
+      <label class="search">${icon('search', 18)}<input type="search" id="libSearch" data-input="libQuery" placeholder="${esc(t('library.search'))}" value="${esc(ui.libQuery)}"></label>
+      <div class="chips scroll-x">${['', ...MUSCLE_GROUP_IDS.filter(m => m !== 'other')].map(m => `<button class="chip small ${ui.libFilter === m ? 'on' : ''}" data-act="libFilter" data-arg="${m}">${esc(m ? t('muscle.' + m) : t('library.all'))}</button>`).join('')}</div>
+      <div class="sheet-scroll" id="libList">${vLibraryList()}</div>`);
+  }
+
+  if(ui.sheet === 'day' && d){
+    return wrap(`
+      <h2 class="display sheet-title">${esc(t('daySheet.title'))}</h2>
+      <label class="field"><span>${esc(t('daySheet.name'))}</span><input type="text" id="dayName" data-input="dayName" value="${esc(d.name)}"></label>
+      ${ui.confirmDeleteDay
+        ? `<div class="msg msg-error">${esc(t('day.deleteConfirm', {name: d.name}))}</div>
+           <div class="row-btns"><button class="btn btn-ghost" data-act="cancelDeleteDay">${esc(t('common.cancel'))}</button><button class="btn btn-danger" data-act="deleteDay">${esc(t('daySheet.deleteConfirm'))}</button></div>`
+        : `<button class="btn btn-ghost danger-text" data-act="askDeleteDay">${icon('trash', 18)} ${esc(t('daySheet.delete'))}</button>`}
+      <button class="btn btn-primary" data-act="closeSheet">${esc(t('common.done'))}</button>`);
+  }
+
+  if(ui.sheet === 'stop' && state.running){
+    const doneSets = steps.slice(0, state.stepIndex).filter(s => s.mode === 'exercise').length;
+    const allSets = steps.filter(s => s.mode === 'exercise').length;
+    return wrap(`
+      <h2 class="display sheet-title">${esc(t('stop.title'))}</h2>
+      <p class="muted">${esc(t('stop.text', {done: doneSets, total: allSets}))}</p>
+      <button class="btn btn-primary" data-act="resumeFromStop">${esc(t('stop.continue'))}</button>
+      <button class="btn btn-ghost" data-act="stopTraining">${esc(t('stop.end'))}</button>`, 'resumeFromStop');
+  }
+
+  if(ui.sheet === 'regen'){
+    return wrap(`
+      <h2 class="display sheet-title">${esc(t('onboarding.regenerateModalTitle'))}</h2>
+      <p class="muted">${esc(t('onboarding.regenerateModalText'))}</p>
+      <button class="btn btn-primary" data-act="confirmRegenerate">${esc(t('onboarding.regenerateModalConfirm'))}</button>
+      <button class="btn btn-ghost" data-act="closeSheet">${esc(t('common.cancel'))}</button>`);
+  }
+
+  if(ui.sheet === 'deleteAccount'){
+    return wrap(`
+      <h2 class="display sheet-title">${esc(t('profile.deleteModalTitle'))}</h2>
+      <p class="muted">${esc(t('profile.deleteAccountWarning'))}</p>
+      <label class="field"><span>${esc(t('profile.deleteModalPasswordLabel'))}</span><input type="password" id="deletePw" autocomplete="current-password" data-input="deletePw" value=""></label>
+      <button class="btn btn-danger" data-act="confirmDeleteAccount">${esc(t('profile.deleteModalConfirmButton'))}</button>
+      <button class="btn btn-ghost" data-act="closeSheet">${esc(t('common.cancel'))}</button>`);
+  }
+  return '';
+}
+function vLibraryList(){
+  const q = ui.libQuery.trim().toLowerCase();
+  const items = (exerciseLibrary || []).filter(e => (!ui.libFilter || e.muscle === ui.libFilter) && (!q || e.name.toLowerCase().includes(q)));
+  const custom = `<button class="list-row" data-act="addCustomExercise"><span class="lib-plus">${icon('plus', 18)}</span><div class="grow"><b>${esc(q ? t('library.customNamed', {name: ui.libQuery.trim()}) : t('library.custom'))}</b><small>${esc(t('library.customHint'))}</small></div></button>`;
+  if(!exerciseLibrary) return custom + `<div class="muted pad">${esc(t('common.loading'))}</div>`;
+  return custom + items.map(e => `<button class="list-row" data-act="addLibraryExercise" data-arg="${esc(e.id)}"><i class="dot" style="background:${muscleColor(e.muscle)}"></i>
+    <div class="grow"><b>${esc(e.name)}</b><small>${esc(t('muscle.' + e.muscle))} · ${esc(e.equipment.map(x => t('equipment.' + x)).join(', '))}</small></div>${icon('plus', 18)}</button>`).join('')
+    + (items.length ? '' : `<div class="muted pad">${esc(t('library.noMatch'))}</div>`);
+}
+
+/* ---------- Aktionen ---------- */
+function currentExercise(){
+  const d = activeDay();
+  return d ? d.exercises.find(e => e.id === ui.editExId) : null;
+}
+function openSheet(name){ ui.sheet = name; rerender(); }
+function closeSheet(){ ui.sheet = null; ui.confirmDeleteDay = false; rerender(); }
+function insertExercise(ex){
+  const d = activeDay();
+  ex.id = uid();
+  const list = d.exercises;
+  // Neue Uebungen vor das abschliessende Dehnen setzen, falls es eines gibt.
+  const at = list.length && list[list.length - 1].muscle === 'stretch' ? list.length - 1 : list.length;
+  list.splice(at, 0, ex);
+  schedulePersist();
+  ui.editExId = ex.id;
+  ui.sheet = 'editEx';
+  rerender();
+}
+function clampSeconds(v){ return Math.max(0, Math.min(600, v)); }
+
+const ACTIONS = {
+  // Anmeldung
+  authSubmit(){
+    const email = drafts.email.trim(), pw = drafts.password, isLogin = authMode === 'login';
     if(!email || !pw){ authError = t('auth.fillBoth'); render(); return; }
     if(!EMAIL_RE.test(email)){ authError = t('auth.invalidEmail'); render(); return; }
     if(!isLogin && pw.length < 8){ authError = t('auth.passwordTooShort'); render(); return; }
     if(isLogin) handleLogin(email, pw); else handleRegister(email, pw);
-  });
-  const onEnter = (e) => { if(e.key === 'Enter') submitBtn.click(); };
-  emailInput.addEventListener('keydown', onEnter);
-  pwInput.addEventListener('keydown', onEnter);
+  },
+  authSwitch(){ authMode = authMode === 'login' ? 'register' : 'login'; authError = ''; authInfo = ''; render(); },
+  resetPassword(){ handlePasswordReset(drafts.email.trim()); },
+  logout(){ handleLogout(); },
 
-  card.appendChild(submitBtn);
-
-  if(isLogin){
-    const forgot = el('div', {class:'auth-forgot'});
-    const forgotLink = el('a', {}, [t('auth.forgotPassword')]);
-    forgotLink.addEventListener('click', () => handlePasswordReset(emailInput.value.trim()));
-    forgot.appendChild(forgotLink);
-    card.appendChild(forgot);
-  }
-
-  const switchRow = el('div', {class:'auth-switch'});
-  const switchLink = el('a', {}, [isLogin ? t('auth.switchToRegister') : t('auth.switchToLogin')]);
-  switchLink.addEventListener('click', () => {
-    authMode = isLogin ? 'register' : 'login';
-    authError = ''; authInfo = '';
+  // Navigation
+  tab(id){
+    if(ui.tab === id) return;
+    ui.tab = id; profileError = ''; profileInfo = '';
+    if(id === 'history') loadHistory();
     render();
-  });
-  switchRow.appendChild(switchLink);
-  card.appendChild(switchRow);
+  },
+  pickDay(id){ state.activeDayId = id; render(); },
+  addDay(){
+    const day = { id: uid(), name: t('main.newDayName'), exercises: [] };
+    state.plan.days.push(day);
+    state.activeDayId = day.id;
+    schedulePersist();
+    ui.sheet = 'day';
+    render();
+    const input = document.getElementById('dayName');
+    if(input){ input.focus(); input.select(); }
+  },
+  dismissIntro(){ onboardingCardDismissed = true; render(); },
+  openDaySheet(){ ui.confirmDeleteDay = false; openSheet('day'); },
+  askDeleteDay(){ ui.confirmDeleteDay = true; rerender(); },
+  cancelDeleteDay(){ ui.confirmDeleteDay = false; rerender(); },
+  deleteDay(){
+    const d = activeDay();
+    state.plan.days = state.plan.days.filter(x => x.id !== d.id);
+    state.activeDayId = null;
+    schedulePersist();
+    closeSheet();
+  },
+  closeSheet(){ closeSheet(); },
 
-  wrap.appendChild(card);
-  return wrap;
-}
+  // Uebungen
+  editEx(id){ ui.editExId = id; openSheet('editEx'); },
+  exMuscle(m){ currentExercise().muscle = m; schedulePersist(); rerender(); },
+  exSets(v){ const ex = currentExercise(); ex.sets = Math.max(1, Math.min(20, ex.sets + Number(v))); schedulePersist(); rerender(); },
+  exSeconds(v){ const ex = currentExercise(); ex.seconds = Math.max(5, Math.min(3600, ex.seconds + Number(v))); schedulePersist(); rerender(); },
+  exSetPause(v){ const ex = currentExercise(); ex.setPauseOverride = clampSeconds(effectiveSetPause(ex) + Number(v)); schedulePersist(); rerender(); },
+  exSetPauseDefault(){ currentExercise().setPauseOverride = null; schedulePersist(); rerender(); },
+  exPauseAfter(v){ const ex = currentExercise(); ex.pauseAfterOverride = clampSeconds(effectivePauseAfter(ex) + Number(v)); schedulePersist(); rerender(); },
+  exPauseAfterDefault(){ currentExercise().pauseAfterOverride = null; schedulePersist(); rerender(); },
+  exMove(dir){
+    const list = activeDay().exercises, i = list.findIndex(e => e.id === ui.editExId), j = i + Number(dir);
+    if(j < 0 || j >= list.length) return;
+    [list[i], list[j]] = [list[j], list[i]];
+    schedulePersist(); rerender();
+  },
+  exRemove(){
+    const list = activeDay().exercises;
+    list.splice(list.findIndex(e => e.id === ui.editExId), 1);
+    schedulePersist(); closeSheet();
+  },
+  openLibrary(){
+    ui.libQuery = ''; ui.libFilter = '';
+    if(!exerciseLibrary) loadExerciseLibrary().then(() => { if(ui.sheet === 'library') refreshLibraryList(); }).catch(() => {});
+    openSheet('library');
+  },
+  libFilter(m){ ui.libFilter = m; rerender(); const s = document.getElementById('libSearch'); if(s && ui.libQuery) s.focus(); },
+  addLibraryExercise(id){
+    const entry = (exerciseLibrary || []).find(e => e.id === id);
+    if(entry) insertExercise(makeExercise(entry.name, entry.muscle, 3, 30));
+  },
+  addCustomExercise(){
+    insertExercise(makeExercise(ui.libQuery.trim(), ui.libFilter || 'other', 3, 30));
+    const input = document.getElementById('exName');
+    if(input && !input.value) input.focus();
+  },
 
-const LANGUAGE_NAMES = { de: 'Deutsch', en: 'English', fr: 'Français', es: 'Español' };
+  // Training
+  enableSound(){ setTimeout(() => { beep(880, 140, 0.5); updateSoundHint(); }, 150); },
+  start(){ const d = activeDay(); if(d && d.exercises.length) startTimer(d); },
+  togglePause(){ togglePause(); },
+  skipStep(){ skipStep(); },
+  prevStep(){ prevStep(); },
+  askStop(){ if(!state.paused) togglePause(); ui.sheet = 'stop'; render(); },
+  resumeFromStop(){ ui.sheet = null; if(state.paused) togglePause(); else render(); },
+  stopTraining(){ ui.sheet = null; stopTimer(); },
+  closeFinished(){ state.screen = 'main'; ui.finished = null; ui.tab = 'train'; state.activeDayId = null; render(); },
 
-function openDeleteAccountModal(){
-  openModal((close) => {
-    const wrap = el('div', {});
-    wrap.appendChild(el('div', {class:'modal-title'}, [t('profile.deleteModalTitle')]));
-    wrap.appendChild(el('div', {class:'sub'}, [t('profile.deleteAccountWarning')]));
-
-    const pwField = el('div', {class:'auth-field'});
-    pwField.appendChild(el('label', {}, [t('profile.deleteModalPasswordLabel')]));
-    const pwInput = el('input', {type:'password'});
-    pwField.appendChild(pwInput);
-    wrap.appendChild(pwField);
-
-    const actions = el('div', {class:'modal-actions'});
-    const cancelBtn = el('button', {class:'btn'}, [t('common.cancel')]);
-    cancelBtn.addEventListener('click', close);
-    const confirmBtn = el('button', {class:'btn btn-danger'}, [t('profile.deleteModalConfirmButton')]);
-    confirmBtn.addEventListener('click', () => {
-      const pw = pwInput.value;
-      close();
-      handleDeleteAccount(pw);
-    });
-    actions.appendChild(cancelBtn);
-    actions.appendChild(confirmBtn);
-    wrap.appendChild(actions);
-
-    return wrap;
-  });
-}
-
-function renderProfileScreen(){
-  const wrap = el('div', {});
-
-  const head = el('div', {class:'user-bar'});
-  const backBtn = el('button', {class:'btn logout-btn'}, ['← ' + t('profile.back')]);
-  backBtn.addEventListener('click', () => { state.screen = 'main'; render(); });
-  head.appendChild(backBtn);
-  wrap.appendChild(head);
-
-  wrap.appendChild(el('h1', {}, [t('profile.title')]));
-  wrap.appendChild(el('div', {class:'sub'}, [authUser.email || '']));
-
-  if(profileError) wrap.appendChild(el('div', {class:'auth-error'}, [profileError]));
-  if(profileInfo) wrap.appendChild(el('div', {class:'auth-info'}, [profileInfo]));
-
-  // Darstellung: Theme + Sprache
-  const appearanceCard = el('div', {class:'card'});
-  appearanceCard.appendChild(el('div', {class:'card-title'}, [t('profile.appearance')]));
-
-  const themeField = el('div', {class:'field'});
-  themeField.appendChild(el('label', {}, [t('profile.appearance')]));
-  const themeSelect = el('select', {});
-  const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
-  ['dark','light'].forEach(th => {
-    const opt = el('option', {value:th}, [t(th === 'dark' ? 'profile.themeDark' : 'profile.themeLight')]);
-    if(th === currentTheme) opt.setAttribute('selected','selected');
-    themeSelect.appendChild(opt);
-  });
-  themeSelect.addEventListener('change', e => {
-    applyTheme(e.target.value);
-    settings.theme = e.target.value;
-    scheduleSettingsPersist();
-  });
-  themeField.appendChild(themeSelect);
-  appearanceCard.appendChild(themeField);
-
-  const langField = el('div', {class:'field'});
-  langField.appendChild(el('label', {}, [t('profile.language')]));
-  const langSelect = el('select', {});
-  SUPPORTED_LANGUAGES.forEach(lang => {
-    const opt = el('option', {value:lang}, [LANGUAGE_NAMES[lang]]);
-    if(lang === currentLanguage) opt.setAttribute('selected','selected');
-    langSelect.appendChild(opt);
-  });
-  langSelect.addEventListener('change', e => { setLanguage(e.target.value); });
-  langField.appendChild(langSelect);
-  appearanceCard.appendChild(langField);
-
-  wrap.appendChild(appearanceCard);
-
-  const onboardingLinkRow = el('div', {class:'profile-link-row'});
-  const onboardingLink = el('a', {}, [t('onboarding.editLink')]);
-  onboardingLink.addEventListener('click', () => { state.screen = 'onboarding'; render(); });
-  onboardingLinkRow.appendChild(onboardingLink);
-  wrap.appendChild(onboardingLinkRow);
-
-  // Passwort aendern
-  const pwCard = el('div', {class:'card'});
-  pwCard.appendChild(el('div', {class:'card-title'}, [t('profile.changePasswordTitle')]));
-
-  const curPwField = el('div', {class:'auth-field'});
-  curPwField.appendChild(el('label', {}, [t('profile.currentPassword')]));
-  const curPwInput = el('input', {type:'password', autocomplete:'current-password'});
-  curPwField.appendChild(curPwInput);
-  pwCard.appendChild(curPwField);
-
-  const newPwField = el('div', {class:'auth-field'});
-  newPwField.appendChild(el('label', {}, [t('profile.newPassword')]));
-  const newPwInput = el('input', {type:'password', autocomplete:'new-password'});
-  newPwField.appendChild(newPwInput);
-  newPwField.appendChild(el('div', {class:'auth-hint'}, [t('auth.passwordHint')]));
-  pwCard.appendChild(newPwField);
-
-  const changePwBtn = el('button', {class:'btn btn-block'}, [t('profile.changePasswordButton')]);
-  changePwBtn.addEventListener('click', () => {
-    handleChangePassword(curPwInput.value, newPwInput.value);
-  });
-  pwCard.appendChild(changePwBtn);
-
-  wrap.appendChild(pwCard);
-
-  // Gefahrenzone: Account loeschen
-  const dangerCard = el('div', {class:'card'});
-  dangerCard.appendChild(el('div', {class:'card-title'}, [t('profile.dangerZone')]));
-  dangerCard.appendChild(el('div', {class:'sub'}, [t('profile.deleteAccountWarning')]));
-  const deleteBtn = el('button', {class:'btn btn-danger btn-block'}, [t('profile.deleteAccountButton')]);
-  deleteBtn.addEventListener('click', () => openDeleteAccountModal());
-  dangerCard.appendChild(deleteBtn);
-  wrap.appendChild(dangerCard);
-
-  return wrap;
-}
-
-function buildCheckboxList(idList, translationPrefix, selectedArray, onChange){
-  const wrap = el('div', {class:'checkbox-list'});
-  idList.forEach(id => {
-    const row = el('label', {class:'checkbox-list-item'});
-    const checkbox = el('input', {type:'checkbox'});
-    checkbox.checked = selectedArray.includes(id);
-    checkbox.addEventListener('change', () => {
-      const idx = selectedArray.indexOf(id);
-      if(checkbox.checked && idx === -1) selectedArray.push(id);
-      else if(!checkbox.checked && idx !== -1) selectedArray.splice(idx, 1);
-      onChange();
-    });
-    row.appendChild(checkbox);
-    row.appendChild(el('span', {}, [t(translationPrefix + id)]));
-    wrap.appendChild(row);
-  });
-  return wrap;
-}
-
-function renderOnboardingScreen(){
-  const wrap = el('div', {});
-
-  const head = el('div', {class:'user-bar'});
-  const backBtn = el('button', {class:'btn logout-btn'}, ['← ' + t('onboarding.back')]);
-  backBtn.addEventListener('click', () => { state.screen = 'main'; render(); });
-  head.appendChild(backBtn);
-  wrap.appendChild(head);
-
-  wrap.appendChild(el('h1', {}, [t('onboarding.title')]));
-  wrap.appendChild(el('div', {class:'sub'}, [t('onboarding.intro')]));
-
-  const card = el('div', {class:'card'});
-
-  card.appendChild(el('div', {class:'card-title'}, [t('onboarding.equipment')]));
-  card.appendChild(buildCheckboxList(EQUIPMENT_IDS, 'equipment.', onboarding.equipment, () => scheduleOnboardingPersist()));
-
-  card.appendChild(el('div', {class:'card-title', style:{marginTop:'16px'}}, [t('onboarding.focus')]));
-  card.appendChild(buildCheckboxList(FOCUS_IDS, 'focus.', onboarding.focus, () => scheduleOnboardingPersist()));
-
-  const daysField = el('div', {class:'field', style:{marginTop:'16px'}});
-  daysField.appendChild(el('label', {}, [t('onboarding.daysPerWeek')]));
-  const daysInput = el('input', {type:'number', min:'1', max:'7', step:'1'});
-  daysInput.value = onboarding.daysPerWeek != null ? onboarding.daysPerWeek : '';
-  daysInput.addEventListener('input', e => {
-    const v = parseInt(e.target.value, 10);
-    onboarding.daysPerWeek = isNaN(v) ? null : v;
-    scheduleOnboardingPersist();
-  });
-  daysField.appendChild(daysInput);
-  card.appendChild(daysField);
-
-  const minutesField = el('div', {class:'field', style:{marginTop:'8px'}});
-  minutesField.appendChild(el('label', {}, [t('onboarding.sessionMinutes')]));
-  const minutesInput = el('input', {type:'number', min:'10', step:'5'});
-  minutesInput.value = onboarding.sessionMinutes != null ? onboarding.sessionMinutes : '';
-  minutesInput.addEventListener('input', e => {
-    const v = parseInt(e.target.value, 10);
-    onboarding.sessionMinutes = isNaN(v) ? null : v;
-    scheduleOnboardingPersist();
-  });
-  minutesField.appendChild(minutesInput);
-  card.appendChild(minutesField);
-
-  const constraintsField = el('div', {class:'auth-field', style:{marginTop:'12px'}});
-  constraintsField.appendChild(el('label', {}, [t('onboarding.constraints')]));
-  const constraintsInput = el('input', {type:'text', placeholder: t('onboarding.constraintsPlaceholder')});
-  constraintsInput.value = onboarding.constraints || '';
-  constraintsInput.addEventListener('input', e => {
-    onboarding.constraints = e.target.value;
-    scheduleOnboardingPersist();
-  });
-  constraintsField.appendChild(constraintsInput);
-  card.appendChild(constraintsField);
-
-  wrap.appendChild(card);
-
-  if(onboardingGenerateError) wrap.appendChild(el('div', {class:'auth-error'}, [onboardingGenerateError]));
-
-  const actionsRow = el('div', {class:'onboarding-card-actions'});
-
-  const wasCompleted = onboarding.completed;
-  const generateBtn = el('button', {class:'btn btn-primary btn-block'}, [
-    onboardingGenerating ? t('onboarding.generating') : t(wasCompleted ? 'onboarding.regenerateButton' : 'onboarding.generateButton')
-  ]);
-  generateBtn.disabled = onboardingGenerating;
-  generateBtn.addEventListener('click', () => {
-    if(wasCompleted) openRegeneratePlanModal(runGeneration);
+  // Trainingsziele
+  openSetup(){ state.screen = 'onboarding'; ui.setupOpen = 0; onboardingGenerateError = ''; render(); },
+  closeSetup(){ state.screen = 'main'; render(); },
+  openSection(i){ ui.setupOpen = Number(i); render(); },
+  toggleEquipment(id){ toggleIn(onboarding.equipment, id); scheduleOnboardingPersist(); rerender(); },
+  toggleFocus(id){ toggleIn(onboarding.focus, id); scheduleOnboardingPersist(); rerender(); },
+  setDays(n){ onboarding.daysPerWeek = Number(n); scheduleOnboardingPersist(); rerender(); },
+  setMinutes(n){ onboarding.sessionMinutes = Number(n); scheduleOnboardingPersist(); rerender(); },
+  generate(){
+    if(onboarding.completed && state.plan.days.length) openSheet('regen');
     else runGeneration();
-  });
-  actionsRow.appendChild(generateBtn);
+  },
+  confirmRegenerate(){ ui.sheet = null; runGeneration(); },
+  saveOnboardingOnly(){ onboarding.completed = true; persistOnboarding(); state.screen = 'main'; render(); },
 
-  const saveOnlyBtn = el('button', {class:'btn btn-block'}, [t('onboarding.saveOnlyButton')]);
-  saveOnlyBtn.disabled = onboardingGenerating;
-  saveOnlyBtn.addEventListener('click', () => {
-    onboarding.completed = true;
-    persistOnboarding();
-    state.screen = 'main';
-    render();
-  });
-  actionsRow.appendChild(saveOnlyBtn);
+  // Profil
+  globalSetPause(v){ state.plan.setPauseSeconds = clampSeconds(state.plan.setPauseSeconds + Number(v)); schedulePersist(); rerender(); },
+  globalPause(v){ state.plan.pauseSeconds = clampSeconds(state.plan.pauseSeconds + Number(v)); schedulePersist(); rerender(); },
+  toggleSound(){ state.plan.soundOn = !state.plan.soundOn; schedulePersist(); rerender(); },
+  setTheme(theme){ applyTheme(theme); settings.theme = theme === 'system' ? null : theme; scheduleSettingsPersist(); rerender(); },
+  togglePw(){ ui.pwOpen = !ui.pwOpen; rerender(); },
+  changePassword(){ handleChangePassword(drafts.curPw, drafts.newPw).then(() => { if(profileInfo){ drafts.curPw = ''; drafts.newPw = ''; ui.pwOpen = false; rerender(); } }); },
+  openDeleteAccount(){ drafts.deletePw = ''; openSheet('deleteAccount'); },
+  confirmDeleteAccount(){ const pw = drafts.deletePw; drafts.deletePw = ''; ui.sheet = null; render(); handleDeleteAccount(pw); }
+};
+function toggleIn(list, id){ const i = list.indexOf(id); if(i < 0) list.push(id); else list.splice(i, 1); }
+function refreshLibraryList(){ const box = document.getElementById('libList'); if(box) box.innerHTML = vLibraryList(); }
 
-  wrap.appendChild(actionsRow);
+// Texteingaben: Daten direkt aktualisieren, ohne neu zu zeichnen (sonst ginge der Fokus verloren).
+const INPUTS = {
+  email(v){ drafts.email = v; }, password(v){ drafts.password = v; },
+  curPw(v){ drafts.curPw = v; }, newPw(v){ drafts.newPw = v; }, deletePw(v){ drafts.deletePw = v; },
+  exName(v){ const ex = currentExercise(); if(ex){ ex.name = v; schedulePersist(); } },
+  dayName(v){ const d = activeDay(); if(d){ d.name = v; schedulePersist(); } },
+  libQuery(v){ ui.libQuery = v; refreshLibraryList(); },
+  constraints(v){ onboarding.constraints = v; scheduleOnboardingPersist(); }
+};
 
-  return wrap;
-}
+document.addEventListener('click', (e) => {
+  const target = e.target.closest('[data-act]');
+  if(!target || !document.getElementById('app').contains(target)) return;
+  // Klick innerhalb eines Sheets soll nicht den Hintergrund (= Schliessen) ausloesen.
+  if(target.classList.contains('sheet-backdrop') && e.target.closest('[data-stop]')) return;
+  const fn = ACTIONS[target.dataset.act];
+  if(fn) fn(target.dataset.arg);
+});
+document.addEventListener('input', (e) => {
+  const key = e.target.dataset && e.target.dataset.input;
+  if(key && INPUTS[key]) INPUTS[key](e.target.value);
+});
+document.addEventListener('change', (e) => {
+  if(e.target.dataset && e.target.dataset.change === 'language') setLanguage(e.target.value);
+});
+document.addEventListener('keydown', (e) => {
+  if(e.key === 'Escape' && ui.sheet){ if(ui.sheet === 'stop') ACTIONS.resumeFromStop(); else closeSheet(); return; }
+  if(e.key === 'Enter' && e.target.dataset && e.target.dataset.enter){ const fn = ACTIONS[e.target.dataset.enter]; if(fn) fn(); }
+});
 
-/* ---------- Historie ---------- */
+/* ---------- Historie laden ---------- */
 let historyLoading = false;
 let historySessions = null; // null = noch nicht geladen
 let historyError = '';
-let expandedExerciseKeys = new Set();
 
 async function loadHistory(){
   if(!authUser) return;
-  historyLoading = true; historyError = ''; render();
+  historyLoading = true; historyError = '';
   try{
-    const cutoff = new Date(Date.now() - 30*24*60*60*1000);
+    // 35 Tage, damit die vier Wochen-Ringe (inkl. laufender Woche) vollstaendig sind.
+    const cutoff = new Date(Date.now() - 35*24*60*60*1000);
     const snap = await db.collection('users').doc(authUser.uid).collection('sessions')
       .where('finishedAt', '>=', cutoff)
       .orderBy('finishedAt', 'desc')
@@ -1200,315 +1579,11 @@ async function loadHistory(){
     historySessions = snap.docs.map(d => d.data());
   }catch(e){
     historyError = e.message || t('error.unknown');
-    historySessions = [];
+    if(historySessions === null) historySessions = [];
   }
   historyLoading = false;
-  render();
+  if(!state.running) rerender();
 }
-
-function aggregateByExercise(sessions){
-  const map = new Map();
-  sessions.forEach(s => {
-    (s.exercises || []).forEach(ex => {
-      const key = ex.name + '|' + (ex.muscle || '');
-      if(!map.has(key)) map.set(key, { name: ex.name, muscle: ex.muscle, count: 0, sessions: [] });
-      const entry = map.get(key);
-      entry.count += 1;
-      entry.sessions.push(s);
-    });
-  });
-  return Array.from(map.values()).sort((a,b) => b.count - a.count);
-}
-
-function renderHistoryExerciseCard(entry){
-  const card = el('div', {class:'card'});
-  const key = entry.name + '|' + (entry.muscle || '');
-  const isExpanded = expandedExerciseKeys.has(key);
-
-  const head = el('div', {class:'collapsible-head'});
-  head.appendChild(el('span', {class:`chevron ${isExpanded?'open':''}`}, ['▸']));
-  const titleWrap = el('div', {style:{flex:'1'}});
-  titleWrap.appendChild(el('div', {}, [entry.name || t('exercise.namePlaceholder')]));
-  if(entry.muscle) titleWrap.appendChild(el('div', {class:'collapsible-title'}, [t('muscle.'+entry.muscle)]));
-  head.appendChild(titleWrap);
-  head.appendChild(el('div', {class:'pause-value'}, [t('history.countBadge', {count: entry.count})]));
-  head.addEventListener('click', () => {
-    if(isExpanded) expandedExerciseKeys.delete(key); else expandedExerciseKeys.add(key);
-    render();
-  });
-  card.appendChild(head);
-
-  if(isExpanded){
-    const body = el('div', {class:'collapsible-body'});
-    entry.sessions.slice(0, 10).forEach(s => {
-      const dateStr = (s.finishedAt && s.finishedAt.toDate) ? s.finishedAt.toDate().toLocaleDateString() : '';
-      body.appendChild(el('div', {class:'collapsible-summary'}, [`${dateStr} · ${s.dayName || ''}`]));
-    });
-    card.appendChild(body);
-  }
-
-  return card;
-}
-
-function renderHistoryScreen(){
-  const wrap = el('div', {});
-
-  const head = el('div', {class:'user-bar'});
-  const backBtn = el('button', {class:'btn logout-btn'}, ['← ' + t('history.back')]);
-  backBtn.addEventListener('click', () => { state.screen = 'main'; render(); });
-  head.appendChild(backBtn);
-  wrap.appendChild(head);
-
-  wrap.appendChild(el('h1', {}, [t('history.title')]));
-  wrap.appendChild(el('div', {class:'sub'}, [t('history.subtitle')]));
-
-  if(historyLoading || historySessions === null){
-    wrap.appendChild(el('div', {class:'empty-note'}, [t('common.loading')]));
-    return wrap;
-  }
-  if(historyError){
-    wrap.appendChild(el('div', {class:'auth-error'}, [historyError]));
-  }
-
-  const completedSessions = historySessions.filter(s => s.completed);
-  if(completedSessions.length === 0){
-    wrap.appendChild(el('div', {class:'empty-note'}, [t('history.empty')]));
-    return wrap;
-  }
-
-  aggregateByExercise(completedSessions).forEach(entry => {
-    wrap.appendChild(renderHistoryExerciseCard(entry));
-  });
-
-  return wrap;
-}
-
-function renderMainView(){
-  const wrap = el('div', {});
-  const userBar = el('div', {class:'user-bar'});
-  userBar.appendChild(el('span', {class:'user-email'}, [authUser.email || '']));
-  const userBarBtns = el('div', {class:'user-bar-btns'});
-  const historyBtn = el('button', {class:'btn logout-btn'}, ['📊']);
-  historyBtn.addEventListener('click', () => { state.screen = 'history'; historySessions = null; render(); loadHistory(); });
-  userBarBtns.appendChild(historyBtn);
-  const settingsBtn = el('button', {class:'btn logout-btn'}, ['⚙']);
-  settingsBtn.addEventListener('click', () => { state.screen = 'profile'; render(); });
-  userBarBtns.appendChild(settingsBtn);
-  const logoutBtn = el('button', {class:'btn logout-btn'}, [t('main.logout')]);
-  logoutBtn.addEventListener('click', handleLogout);
-  userBarBtns.appendChild(logoutBtn);
-  userBar.appendChild(userBarBtns);
-  wrap.appendChild(userBar);
-  wrap.appendChild(el('h1', {}, [t('main.title')]));
-  wrap.appendChild(el('div', {class:'sub'}, [t('main.subtitle')]));
-
-  if(!onboarding.completed && !onboardingCardDismissed){
-    const obCard = el('div', {class:'card onboarding-card'});
-    obCard.appendChild(el('div', {class:'card-title'}, [t('onboarding.introTitle')]));
-    obCard.appendChild(el('div', {class:'sub', style:{margin:'0 0 4px'}}, [t('onboarding.introText')]));
-    const obActions = el('div', {class:'onboarding-card-actions'});
-    const skipBtn = el('button', {class:'btn'}, [t('onboarding.introSkip')]);
-    skipBtn.addEventListener('click', () => { onboardingCardDismissed = true; render(); });
-    const fillBtn = el('button', {class:'btn btn-primary'}, [t('onboarding.introStart')]);
-    fillBtn.addEventListener('click', () => { state.screen = 'onboarding'; render(); });
-    obActions.appendChild(skipBtn);
-    obActions.appendChild(fillBtn);
-    obCard.appendChild(obActions);
-    wrap.appendChild(obCard);
-  }
-
-  const soundRow = el('div', {class:'sound-toggle', style:{marginBottom:'16px'}});
-  const soundCheckbox = el('input', {type:'checkbox', id:'soundToggle'});
-  soundCheckbox.checked = state.plan.soundOn;
-  soundCheckbox.addEventListener('change', e => { state.plan.soundOn = e.target.checked; schedulePersist(); });
-  soundRow.appendChild(soundCheckbox);
-  soundRow.appendChild(el('label', {for:'soundToggle'}, [t('main.soundLabel')]));
-  wrap.appendChild(soundRow);
-
-  // Tage
-  if(state.plan.days.length === 0){
-    wrap.appendChild(el('div', {class:'empty-note'}, [t('main.noDaysYet')]));
-  }
-  state.plan.days.forEach((day, dayIdx) => {
-    wrap.appendChild(renderDayCard(day, dayIdx));
-  });
-
-  const addDayBtn = el('button', {class:'btn btn-block'}, [t('main.addDay')]);
-  addDayBtn.addEventListener('click', () => {
-    const newDay = { id: uid(), name: t('main.newDayName'), exercises: [] };
-    state.plan.days.push(newDay);
-    state.expandedDayIds.add(newDay.id);
-    schedulePersist();
-    render();
-  });
-  wrap.appendChild(addDayBtn);
-
-  return wrap;
-}
-
-function renderDayCard(day, dayIdx){
-  const card = el('div', {class:'day-card'});
-  const isExpanded = state.expandedDayIds.has(day.id);
-
-  const head = el('div', {class:'day-head'});
-  const chevron = el('span', {class:`chevron ${isExpanded?'open':''}`, style:{cursor:'pointer'}}, ['▸']);
-  chevron.addEventListener('click', () => {
-    if(isExpanded) state.expandedDayIds.delete(day.id);
-    else state.expandedDayIds.add(day.id);
-    render();
-  });
-  const nameInput = el('input', {class:'day-name-input', type:'text'});
-  nameInput.value = day.name;
-  nameInput.addEventListener('input', e => { day.name = e.target.value; schedulePersist(); });
-  const delBtn = el('button', {class:'icon-btn'}, ['✕']);
-  delBtn.addEventListener('click', () => {
-    if(confirm(t('day.deleteConfirm', {name: day.name}))){
-      state.expandedDayIds.delete(day.id);
-      state.plan.days.splice(dayIdx,1);
-      schedulePersist();
-      render();
-    }
-  });
-  head.appendChild(chevron);
-  head.appendChild(nameInput);
-  head.appendChild(delBtn);
-  card.appendChild(head);
-
-  const metaRow = el('div', {class:'day-meta-row'});
-  metaRow.appendChild(el('div', {class:'day-total', 'data-day-id': day.id}, [t('day.totalDuration', {duration: formatMinSec(dayTotalSeconds(day))})]));
-  const startBtn = el('button', {class:'btn btn-primary day-start-btn'}, [t('day.start')]);
-  startBtn.addEventListener('click', () => {
-    if(day.exercises.length > 0) startTimer(day);
-    else alert(t('day.noExercisesAlert'));
-  });
-  metaRow.appendChild(startBtn);
-  card.appendChild(metaRow);
-
-  if(isExpanded){
-    const body = el('div', {class:'collapsible-body'});
-
-    if(day.exercises.length === 0){
-      body.appendChild(el('div', {class:'empty-note'}, [t('day.noExercisesYet')]));
-    }
-    day.exercises.forEach((ex, exIdx) => {
-      body.appendChild(renderExerciseRow(day, ex, exIdx));
-    });
-    const addExBtn = el('button', {class:'btn add-ex-btn'}, [t('day.addExercise')]);
-    addExBtn.addEventListener('click', () => {
-      day.exercises.push(makeExercise('', MUSCLE_GROUP_IDS[0], 3, 30));
-      schedulePersist();
-      render();
-    });
-    body.appendChild(addExBtn);
-
-    card.appendChild(body);
-  }
-
-  return card;
-}
-
-function updateDayTotalDisplay(day){
-  const elm = document.querySelector(`.day-total[data-day-id="${day.id}"]`);
-  if(elm) elm.textContent = t('day.totalDuration', {duration: formatMinSec(dayTotalSeconds(day))});
-}
-
-function renderExerciseRow(day, ex, exIdx){
-  const row = el('div', {class:'exercise-row'});
-
-  const reorderBox = el('div', {class:'reorder-box'});
-  const upBtn = el('button', {class:'icon-btn reorder-btn'}, ['▲']);
-  upBtn.disabled = (exIdx === 0);
-  upBtn.addEventListener('click', () => {
-    if(exIdx === 0) return;
-    [day.exercises[exIdx-1], day.exercises[exIdx]] = [day.exercises[exIdx], day.exercises[exIdx-1]];
-    schedulePersist();
-    render();
-  });
-  const downBtn = el('button', {class:'icon-btn reorder-btn'}, ['▼']);
-  downBtn.disabled = (exIdx === day.exercises.length - 1);
-  downBtn.addEventListener('click', () => {
-    if(exIdx === day.exercises.length - 1) return;
-    [day.exercises[exIdx+1], day.exercises[exIdx]] = [day.exercises[exIdx], day.exercises[exIdx+1]];
-    schedulePersist();
-    render();
-  });
-  reorderBox.appendChild(upBtn);
-  reorderBox.appendChild(downBtn);
-
-  const content = el('div', {class:'ex-content'});
-  const line1 = el('div', {class:'ex-line1'});
-
-  const nameInput = el('input', {type:'text', class:'ex-name', placeholder: t('exercise.namePlaceholder')});
-  nameInput.value = ex.name;
-  nameInput.addEventListener('input', e => { ex.name = e.target.value; schedulePersist(); });
-
-  const muscleSelect = el('select', {class:'ex-muscle'});
-  MUSCLE_GROUP_IDS.forEach(id => {
-    const opt = el('option', {value:id}, [t('muscle.'+id)]);
-    if(ex.muscle === id) opt.setAttribute('selected','selected');
-    muscleSelect.appendChild(opt);
-  });
-  muscleSelect.addEventListener('change', e => { ex.muscle = e.target.value; schedulePersist(); });
-
-  const delBtn = el('button', {class:'icon-btn'}, ['✕']);
-  delBtn.addEventListener('click', () => {
-    const realIdx = day.exercises.indexOf(ex);
-    if(realIdx >= 0) day.exercises.splice(realIdx, 1);
-    schedulePersist();
-    render();
-  });
-
-  line1.appendChild(nameInput);
-  line1.appendChild(muscleSelect);
-  line1.appendChild(delBtn);
-
-  const line2 = el('div', {class:'ex-line2'});
-
-  const setsField = el('div', {class:'field-mini'});
-  setsField.appendChild(el('label', {}, [t('exercise.sets')]));
-  const setsInput = el('input', {type:'number', min:'1'});
-  setsInput.value = ex.sets;
-  setsInput.addEventListener('input', e => {
-    ex.sets = Math.max(1, parseInt(e.target.value||'1',10));
-    schedulePersist();
-    updateDayTotalDisplay(day);
-  });
-  setsField.appendChild(setsInput);
-
-  const secField = el('div', {class:'field-mini'});
-  secField.appendChild(el('label', {}, [t('exercise.secondsPerSet')]));
-  const secInput = el('input', {type:'number', min:'5', step:'5'});
-  secInput.value = ex.seconds;
-  secInput.addEventListener('input', e => {
-    ex.seconds = Math.max(5, parseInt(e.target.value||'30',10));
-    schedulePersist();
-    updateDayTotalDisplay(day);
-  });
-  secField.appendChild(secInput);
-
-  const pauseField = el('div', {class:'field-mini pause-trigger'});
-  pauseField.appendChild(el('label', {}, [t('exercise.pauseLabel')]));
-  pauseField.appendChild(el('div', {class:'pause-value'}, [
-    t('exercise.pauseSummary', {
-      value: effectivePauseAfter(ex),
-      tag: ex.pauseAfterOverride == null ? t('exercise.linkedTag') : t('exercise.customTag')
-    })
-  ]));
-  pauseField.addEventListener('click', () => openPauseSettingsModal(day, ex));
-
-  line2.appendChild(setsField);
-  line2.appendChild(secField);
-  line2.appendChild(pauseField);
-
-  content.appendChild(line1);
-  content.appendChild(line2);
-
-  row.appendChild(reorderBox);
-  row.appendChild(content);
-  return row;
-}
-
-
 
 /* ---------- Timer-Ablauf ---------- */
 let sessionStartStamp = null;
@@ -1517,13 +1592,17 @@ const PREPARE_SECONDS = 10;
 // Timer beim Zurueckkehren aus dem Hintergrund/nach Bildschirmsperre sofort auf die
 // tatsaechlich vergangene Realzeit aufholen, statt eingefroren zu bleiben.
 let stepDeadline = null;
+let pausedRemainingMs = 0;
+let runDay = null;
 
 function startTimer(day){
   ensureAudio();
+  tryResumeAudio(); // Start ist ein Tipp - hier darf iOS den Kontext freigeben
   steps = buildSteps(day);
   if(steps.length === 0) return;
   steps.unshift({ mode:'prepare', seconds: PREPARE_SECONDS });
   computeStepOffsets();
+  runDay = day;
   state.running = true;
   state.stepIndex = 0;
   state.remaining = steps[0].seconds;
@@ -1536,7 +1615,9 @@ function startTimer(day){
   beepForMode(steps[0].mode);
 
   clearInterval(state.intervalId);
-  state.intervalId = setInterval(tick, 1000);
+  // 4x pro Sekunde, damit Balken fluessig laufen; Toene nur beim Sekundenwechsel.
+  state.intervalId = setInterval(tick, 250);
+  ui.sheet = null;
   render();
 }
 
@@ -1544,16 +1625,18 @@ function tick(){
   if(state.paused || !state.running) return;
   let stepChanged = false;
   while(state.running){
-    const remaining = Math.round((stepDeadline - Date.now())/1000);
+    const remaining = Math.ceil((stepDeadline - Date.now())/1000);
     if(remaining > 0){
+      const secondChanged = remaining !== state.remaining;
       state.remaining = remaining;
       if(stepChanged){
         beepForMode(steps[state.stepIndex].mode);
-        if(navigator.vibrate) navigator.vibrate(150);
-        render();
+        if(!ui.sheet) render();
       } else {
-        if(remaining === 10) tenSecondWarning();
-        if(remaining <= 5) countdownBeep(remaining);
+        if(secondChanged){
+          if(remaining === 10) tenSecondWarning();
+          if(remaining <= 5) countdownBeep(remaining);
+        }
         updateTimerDOM();
       }
       return;
@@ -1568,48 +1651,57 @@ function tick(){
   }
 }
 
-function skipStep(){
-  state.stepIndex += 1;
-  if(state.stepIndex >= steps.length){
-    finishTimer();
-    return;
-  }
-  const s = steps[state.stepIndex];
+function enterStep(index){
+  state.stepIndex = index;
+  const s = steps[index];
   state.remaining = s.seconds;
   stepDeadline = Date.now() + s.seconds*1000;
+  pausedRemainingMs = s.seconds*1000;
   beepForMode(s.mode);
-  if(navigator.vibrate) navigator.vibrate(150);
   render();
+}
+function skipStep(){
+  if(state.stepIndex + 1 >= steps.length){ finishTimer(); return; }
+  enterStep(state.stepIndex + 1);
+}
+// Zurueck: innerhalb der ersten 2 Sekunden zum vorherigen Schritt, sonst aktuellen Schritt neu starten.
+function prevStep(){
+  const s = steps[state.stepIndex];
+  const elapsedInStep = s.seconds - remainingPrecise();
+  enterStep(elapsedInStep < 2 && state.stepIndex > 0 ? state.stepIndex - 1 : state.stepIndex);
 }
 
 function togglePause(){
   if(state.paused){
-    stepDeadline = Date.now() + state.remaining*1000;
+    stepDeadline = Date.now() + pausedRemainingMs;
   } else {
-    state.remaining = Math.max(0, Math.round((stepDeadline - Date.now())/1000));
+    pausedRemainingMs = Math.max(0, stepDeadline - Date.now());
+    state.remaining = Math.ceil(pausedRemainingMs/1000);
   }
   state.paused = !state.paused;
   render();
 }
 function computeSessionSummary(fullyFinished){
   const completedUpToIndex = fullyFinished ? steps.length : state.stepIndex;
-  const elapsed = fullyFinished ? stepsTotalSeconds : elapsedSeconds();
+  const elapsed = fullyFinished ? stepsTotalSeconds : stepStartOffsets[state.stepIndex] + (steps[state.stepIndex].seconds - remainingPrecise());
   const completionFraction = stepsTotalSeconds > 0 ? elapsed / stepsTotalSeconds : 0;
 
   const exerciseMap = new Map();
-  for(let i = 0; i < completedUpToIndex; i++){
+  for(let i = 0; i < steps.length; i++){
     const s = steps[i];
     if(s.mode !== 'exercise') continue;
     const key = s.name + '|' + (s.muscle || '');
     if(!exerciseMap.has(key)){
       exerciseMap.set(key, { name: s.name, muscle: s.muscle, reachedSets: 0, totalSets: s.totalSets });
     }
-    exerciseMap.get(key).reachedSets += 1;
+    if(i < completedUpToIndex) exerciseMap.get(key).reachedSets += 1;
   }
 
   return {
     dayName: state.currentDayName,
-    exercises: Array.from(exerciseMap.values()),
+    // Wie bisher nur Uebungen speichern, die mindestens einen Satz erreicht haben.
+    exercises: Array.from(exerciseMap.values()).filter(e => e.reachedSets > 0),
+    allExercises: Array.from(exerciseMap.values()),
     totalPlannedSeconds: stepsTotalSeconds,
     elapsedSeconds: Math.round(elapsed),
     completionFraction: completionFraction,
@@ -1619,149 +1711,36 @@ function computeSessionSummary(fullyFinished){
 
 async function logSession(summary){
   if(!authUser || summary.elapsedSeconds <= 0) return;
+  const doc = {
+    dayName: summary.dayName,
+    exercises: summary.exercises,
+    startedAt: sessionStartStamp || firebase.firestore.FieldValue.serverTimestamp(),
+    finishedAt: firebase.firestore.FieldValue.serverTimestamp(),
+    totalPlannedSeconds: summary.totalPlannedSeconds,
+    elapsedSeconds: summary.elapsedSeconds,
+    completionFraction: summary.completionFraction,
+    completed: summary.completed
+  };
+  // Sofort lokal eintragen, damit "Dran" und Statistik ohne Neuladen stimmen.
+  if(historySessions) historySessions.unshift(Object.assign({}, doc, { finishedAt: new Date() }));
   try{
-    await db.collection('users').doc(authUser.uid).collection('sessions').add({
-      dayName: summary.dayName,
-      exercises: summary.exercises,
-      startedAt: sessionStartStamp || firebase.firestore.FieldValue.serverTimestamp(),
-      finishedAt: firebase.firestore.FieldValue.serverTimestamp(),
-      totalPlannedSeconds: summary.totalPlannedSeconds,
-      elapsedSeconds: summary.elapsedSeconds,
-      completionFraction: summary.completionFraction,
-      completed: summary.completed
-    });
+    await db.collection('users').doc(authUser.uid).collection('sessions').add(doc);
   }catch(e){ /* Historie ist unterstuetzend, kein User-Feedback noetig */ }
 }
 
-function stopTimer(){
-  logSession(computeSessionSummary(false));
+function endRun(summary){
+  logSession(summary);
   clearInterval(state.intervalId);
   state.running = false;
+  state.paused = false;
   releaseWakeLock();
+  ui.sheet = null;
+  ui.finished = { summary: Object.assign({}, summary, { exercises: summary.allExercises }), day: runDay };
+  state.screen = 'finished';
   render();
 }
-function finishTimer(){
-  logSession(computeSessionSummary(true));
-  clearInterval(state.intervalId);
-  state.running = false;
-  releaseWakeLock();
-  finishFanfare();
-  const app = document.getElementById('app');
-  app.innerHTML = '';
-  const wrap = el('div', {class:'finished'});
-  wrap.appendChild(el('div', {class:'big'}, ['🏁']));
-  wrap.appendChild(el('h1', {}, [t('finished.title')]));
-  wrap.appendChild(el('div', {class:'sub'}, [t('finished.subtitle', {day: state.currentDayName})]));
-  const backBtn = el('button', {class:'btn btn-primary btn-block'}, [t('finished.back')]);
-  backBtn.addEventListener('click', () => { render(); });
-  wrap.appendChild(backBtn);
-  app.appendChild(wrap);
-}
-
-function peekNext(fromIndex){
-  for(let i=fromIndex+1; i<steps.length; i++){
-    const st = steps[i];
-    if(st.mode === 'exercise') return { type:'exercise', name: st.name, setNum: st.setNum, totalSets: st.totalSets };
-  }
-  return null;
-}
-
-function renderTimerScreen(){
-  const s = steps[state.stepIndex];
-  const isRestColor = (s.mode === 'pause' || s.mode === 'prepare');
-  const wrap = el('div', {class:'wrap timer-screen'});
-
-  let primary = '';
-  let secondary = '';
-  let hint = '';
-
-  if(s.mode === 'prepare'){
-    primary = t('timer.prepare');
-    const nxt = peekNext(state.stepIndex);
-    if(nxt && nxt.type === 'exercise') secondary = t('timer.firstExercise', {name: nxt.name});
-  } else if(s.mode === 'exercise'){
-    primary = s.name;
-    secondary = t('timer.exerciseSecondary', {muscle: t('muscle.'+s.muscle), set: s.setNum, total: s.totalSets});
-    if(s.setNum === s.totalSets){
-      const nxt = peekNext(state.stepIndex);
-      if(nxt && nxt.type === 'exercise') hint = t('timer.nextExercise', {name: nxt.name});
-    }
-  } else if(s.mode === 'pause'){
-    primary = t('timer.pause');
-    const nextStep = steps[state.stepIndex+1];
-    if(nextStep && nextStep.mode === 'exercise'){
-      secondary = (nextStep.setNum === 1)
-        ? t('timer.nextExercise', {name: nextStep.name})
-        : t('timer.continueWith', {name: nextStep.name, set: nextStep.setNum, total: nextStep.totalSets});
-    }
-  }
-
-  wrap.appendChild(el('div', {class:'timer-meta'}, [t('timer.stepMeta', {day: state.currentDayName, current: state.stepIndex+1, total: steps.length})]));
-  wrap.appendChild(el('div', {class:`timer-primary ${isRestColor?'pause-mode':'exercise-mode'}`}, [primary]));
-  if(secondary) wrap.appendChild(el('div', {class:'timer-secondary'}, [secondary]));
-  if(hint) wrap.appendChild(el('div', {class:'timer-hint'}, [hint]));
-
-  const ringWrap = el('div', {class:'ring-wrap'});
-  const circumference = 2*Math.PI*108;
-  const ringFrac = Math.max(0, state.remaining) / s.seconds;
-  ringWrap.innerHTML = `
-    <svg width="240" height="240" viewBox="0 0 240 240">
-      <circle class="ring-bg" cx="120" cy="120" r="108"></circle>
-      <circle class="ring-fg ${isRestColor?'pause-mode':''}" id="ringFg" cx="120" cy="120" r="108"
-        stroke-dasharray="${circumference}" stroke-dashoffset="${circumference * (1 - ringFrac)}"></circle>
-    </svg>
-    <div class="ring-center">
-      <div class="ring-time" id="ringTime">${state.remaining}</div>
-    </div>
-  `;
-  wrap.appendChild(ringWrap);
-
-  const overall = el('div', {class:'overall-progress'});
-  const elapsed = elapsedSeconds();
-  overall.innerHTML = `
-    <div class="overall-progress-track">
-      <div class="overall-progress-fill" id="overallFill" style="width:${(elapsed/Math.max(1,stepsTotalSeconds))*100}%"></div>
-    </div>
-    <div class="overall-progress-text">
-      <span id="overallElapsed">${formatClock(elapsed)}</span>
-      <span>${t('timer.overallTotal', {duration: formatClock(stepsTotalSeconds)})}</span>
-    </div>
-  `;
-  wrap.appendChild(overall);
-
-  const controls = el('div', {class:'timer-controls'});
-  const pauseBtn = el('button', {class:'btn'}, [state.paused ? t('timer.resumeBtn') : t('timer.pauseBtn')]);
-  pauseBtn.addEventListener('click', togglePause);
-  const skipBtn = el('button', {class:'btn'}, [t('timer.skipBtn')]);
-  skipBtn.addEventListener('click', skipStep);
-  const cancelBtn = el('button', {class:'btn btn-danger'}, [t('timer.cancelBtn')]);
-  cancelBtn.addEventListener('click', stopTimer);
-  controls.appendChild(pauseBtn);
-  controls.appendChild(skipBtn);
-  controls.appendChild(cancelBtn);
-  wrap.appendChild(controls);
-
-  return wrap;
-}
-
-function updateTimerDOM(){
-  const ring = document.getElementById('ringFg');
-  const timeEl = document.getElementById('ringTime');
-  if(ring && timeEl){
-    const s = steps[state.stepIndex];
-    const frac = Math.max(0, state.remaining) / s.seconds;
-    const circumference = 2*Math.PI*108;
-    ring.style.strokeDashoffset = String(circumference * (1 - frac));
-    timeEl.textContent = Math.max(0, state.remaining);
-  }
-  const fill = document.getElementById('overallFill');
-  const elapsedEl = document.getElementById('overallElapsed');
-  if(fill && elapsedEl){
-    const elapsed = elapsedSeconds();
-    fill.style.width = `${(elapsed/Math.max(1,stepsTotalSeconds))*100}%`;
-    elapsedEl.textContent = formatClock(elapsed);
-  }
-}
+function stopTimer(){ endRun(computeSessionSummary(false)); }
+function finishTimer(){ finishFanfare(); endRun(computeSessionSummary(true)); }
 
 /* ---------- Start ---------- */
 (async function bootstrap(){
@@ -1773,12 +1752,17 @@ function updateTimerDOM(){
     authInfo = '';
     if(user){
       authUser = user;
+      drafts.password = '';
+      historySessions = null;
       loadPlanForCurrentUser();
-      loadExerciseLibrary().catch(()=>{}); // Vorladen, damit sie beim Onboarding meist schon bereitsteht
+      loadHistory();
+      loadExerciseLibrary().catch(()=>{}); // Vorladen fuer Bibliothek und Plan-Generator
     } else {
       authUser = null;
       state.plan = deepClone(DEFAULT_PLAN);
       state.screen = 'main';
+      state.activeDayId = null;
+      ui.tab = 'train'; ui.sheet = null; ui.finished = null;
       settings = { theme: null, language: null };
       onboarding = { equipment: [], focus: [], constraints: '', daysPerWeek: null, sessionMinutes: null, completed: false };
       onboardingCardDismissed = false;

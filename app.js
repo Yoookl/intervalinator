@@ -933,16 +933,17 @@ function render(){
   const keepScroll = render.keepScroll && sc ? sc.scrollTop : null;
   render.keepScroll = false;
 
+  // Laufendes Training: nur Teile aktualisieren, damit das Karten-Rad seine Scrollposition behaelt.
+  if(authReady && authUser && state.running){ renderRun(app); return; }
+
   let html;
   if(!authReady) html = `<div class="center-screen"><div class="muted">${esc(t('common.loading'))}</div></div>`;
   else if(!authUser) html = vAuth();
-  else if(state.running) html = vRun();
   else if(state.screen === 'finished' && ui.finished) html = vFinished();
   else if(state.screen === 'onboarding') html = vSetup();
   else html = vTabs();
   app.innerHTML = html + vSheet();
 
-  if(state.running){ updateTimerDOM(); scrollRunTrack(); }
   if(keepScroll != null){ const n = app.querySelector('.screen'); if(n) n.scrollTop = keepScroll; }
 }
 // Neu zeichnen, ohne dass die Liste nach oben springt (z.B. nach + / - im Sheet).
@@ -1208,48 +1209,195 @@ function nextExerciseStep(fromIndex){
   for(let i = fromIndex + 1; i < steps.length; i++) if(steps[i].mode === 'exercise') return steps[i];
   return null;
 }
-function vRun(){
+/* Trainingsansicht: oben die Stoppuhr im Ring (Schrittzeit) mit Gesamtzeit darunter,
+   unten das Karten-Rad - alle Uebungen als Karten, die aktuelle steht immer in der Mitte,
+   nach oben und unten werden die Karten kleiner und verschwinden im Nebel. */
+const RING_R = 90;
+const RING_C = 2 * Math.PI * RING_R;
+const wheel = {
+  follow: true,      // false, solange der Nutzer selbst gescrollt hat
+  userAt: 0,         // Zeitpunkt der letzten echten Nutzer-Eingabe am Rad
+  lastSet: -99,      // zuletzt von uns gesetzte Scrollposition
+  programmatic: false,
+  anim: null, progT: null, idle: null, resize: null
+};
+
+function runMode(){
+  const s = steps[state.stepIndex];
+  return s.mode === 'exercise' ? 'work' : s.mode === 'pause' ? 'rest' : 'prepare';
+}
+function vRunShell(){
+  return `
+  <div class="run" id="run">
+    <header class="head" data-slot="head"></header>
+    <section class="ring-card" data-slot="top" aria-live="polite"></section>
+    <button class="sound-hint" id="soundHint" data-act="enableSound" hidden>${icon('sound', 18)} ${esc(t('timer.soundBlocked'))}</button>
+    <div class="wheel-wrap"><div class="wheel" id="runWheel"></div></div>
+    <button class="follow-pill" id="followPill" data-act="wheelBack" hidden>${icon('up', 16)} ${esc(t('wheel.back'))}</button>
+    <div class="controls" data-slot="ctl"></div>
+  </div>
+  <div id="sheetSlot"></div>`;
+}
+function vRunTop(){
   const s = steps[state.stepIndex];
   const nxt = nextExerciseStep(state.stepIndex);
   const after = steps[state.stepIndex + 1];
-  let phase, what, mode;
+  let phase, title, sub;
   if(s.mode === 'exercise'){
-    mode = 'work';
     phase = t('timer.setOf', {set: s.setNum, total: s.totalSets});
-    const afterTxt = after ? t('timer.thenPause', {s: after.seconds}) : t('timer.thenDone');
-    what = `${esc(s.name)}<small>${esc(t('muscle.' + s.muscle))} · ${esc(afterTxt)}</small>`;
+    title = s.name;
+    sub = `${t('muscle.' + s.muscle)} · ${after ? t('timer.thenPause', {s: after.seconds}) : t('timer.thenDone')}`;
   } else if(s.mode === 'pause'){
-    mode = 'rest';
     phase = s.kind === 'exercise' ? t('timer.exerciseChange') : t('timer.setPause');
-    what = nxt ? `${esc(t('timer.upNext', {name: nxt.name}))}<small>${esc(t('timer.setOf', {set: nxt.setNum, total: nxt.totalSets}))} · ${nxt.seconds} s</small>` : '';
+    title = nxt ? t('timer.upNext', {name: nxt.name}) : '';
+    sub = nxt ? `${t('timer.setOf', {set: nxt.setNum, total: nxt.totalSets})} · ${nxt.seconds} s` : '';
   } else {
-    mode = 'prepare';
     phase = t('timer.prepare');
-    what = nxt ? `${esc(t('timer.upNext', {name: nxt.name}))}<small>${esc(t('timer.setOf', {set: 1, total: nxt.totalSets}))}</small>` : '';
+    title = nxt ? t('timer.upNext', {name: nxt.name}) : '';
+    sub = nxt ? t('timer.setOf', {set: 1, total: nxt.totalSets}) : '';
   }
   return `
-  <div class="run ${mode}">
-    <header class="head">
-      <button class="icon-btn" data-act="askStop" aria-label="${esc(t('timer.cancelBtn'))}">${icon('close')}</button>
-      <h1 class="display center small">${esc(state.currentDayName)}</h1>
-      <span class="step-count">${state.stepIndex + 1}/${steps.length}</span>
-    </header>
-    <section class="now" aria-live="polite">
-      <div class="phase"><i></i>${esc(phase)}${state.paused ? ' · ' + esc(t('timer.paused')) : ''}</div>
-      <div class="clock" id="runClock">${formatClock(Math.ceil(remainingPrecise()))}</div>
-      <div class="what">${what}</div>
-      <div class="bar"><i id="runBar"></i></div>
-      <div class="totals"><span id="runElapsed"></span><span id="runLeft"></span></div>
-    </section>
-    <button class="sound-hint" id="soundHint" data-act="enableSound" hidden>${icon('sound', 18)} ${esc(t('timer.soundBlocked'))}</button>
-    <div class="screen run-track" id="runTrack">${vTrack(runDay, runPos())}</div>
-    <div class="controls">
-      <button data-act="prevStep" aria-label="${esc(t('timer.prevBtn'))}">${icon('prev')}</button>
-      <button class="main" data-act="togglePause" aria-label="${esc(state.paused ? t('timer.resumeBtn') : t('timer.pauseBtn'))}">${icon(state.paused ? 'play' : 'pause', 28)}</button>
-      <button data-act="skipStep" aria-label="${esc(t('timer.skipBtn'))}">${icon('skip')}</button>
+    <div class="ring-box">
+      <svg viewBox="0 0 200 200" aria-hidden="true">
+        <circle cx="100" cy="100" r="${RING_R}" fill="none" stroke="var(--sunk)" stroke-width="12"/>
+        <circle id="runRing" cx="100" cy="100" r="${RING_R}" fill="none" stroke="var(--ph)" stroke-width="12" stroke-linecap="round" stroke-dasharray="${RING_C}" stroke-dashoffset="${RING_C}"/>
+      </svg>
+      <div class="ring-center">
+        <span class="phase"><i></i>${esc(phase)}${state.paused ? ' · ' + esc(t('timer.paused')) : ''}</span>
+        <span class="ring-clock" id="runClock">${formatClock(Math.ceil(remainingPrecise()))}</span>
+      </div>
     </div>
-  </div>`;
+    <div class="ring-title">${esc(title)}<small>${esc(sub)}</small></div>
+    <div class="overall" aria-label="${esc(t('timer.overallLabel'))}">
+      <span class="num" id="runElapsed"></span><div class="overall-bar"><i id="runTotalBar"></i></div><span class="num" id="runLeft"></span>
+    </div>`;
 }
+function vWheelCards(){
+  const pos = runPos();
+  const list = runDay.exercises;
+  return list.map((ex, i) => {
+    const sets = Math.max(1, ex.sets || 1);
+    const st = i < pos.exIdx ? 'done' : (i === pos.exIdx && pos.restAfter == null ? 'cur' : '');
+    const soon = i === pos.exIdx && pos.restAfter != null;
+    const label = st === 'done' ? t('wheel.done')
+      : st === 'cur' ? t('wheel.now', {set: pos.set, total: sets})
+      : soon ? t('wheel.soon') : i === pos.exIdx + 1 ? t('wheel.next') : t('wheel.later');
+    const pills = Array.from({length: sets}, (_, k) => {
+      const done = st === 'done' || (st === 'cur' && (k + 1 < pos.set || (k + 1 === pos.set && pos.setDone)));
+      const isLive = st === 'cur' && k + 1 === pos.set && !pos.setDone && steps[state.stepIndex].mode === 'exercise';
+      return `<i class="${done ? 'done' : ''}">${isLive ? '<b id="livePill"></b>' : ''}</i>`;
+    }).join('');
+    const setPause = sets > 1 ? ` · ${t('ex.setPauseShort', {s: effectiveSetPause(ex)})}` : '';
+    const card = `<article class="wcard ${st} ${soon ? 'soon' : ''}" data-ex="${i}">
+      <div class="wtop"><span class="wlabel">${esc(label)}</span><span class="wnum">${i + 1}/${list.length}</span></div>
+      <div class="wname">${st === 'done' ? icon('check', 16) : ''}${esc(ex.name || t('exercise.namePlaceholder'))}</div>
+      <div class="wsub"><i style="background:${muscleColor(ex.muscle)}"></i>${esc(t('muscle.' + ex.muscle))} · ${esc(doseLabel(ex))}${esc(setPause)}</div>
+      <div class="pills">${pills}</div>
+    </article>`;
+    if(i === list.length - 1) return card;
+    const gapCur = pos.restAfter === i;
+    return card + `<div class="wgap ${gapCur ? 'cur' : ''}" data-gap="${i}">${icon('clock', 13)} ${esc(gapCur ? t('track.restNow', {s: effectivePauseAfter(ex)}) : t('track.rest', {s: effectivePauseAfter(ex)}))}</div>`;
+  }).join('');
+}
+function renderRun(app){
+  let run = document.getElementById('run');
+  const fresh = !run;
+  if(fresh){
+    app.innerHTML = vRunShell();
+    run = document.getElementById('run');
+    mountWheel();
+  }
+  run.className = 'run ' + runMode();
+  run.querySelector('[data-slot=head]').innerHTML = `
+    <button class="icon-btn" data-act="askStop" aria-label="${esc(t('timer.cancelBtn'))}">${icon('close')}</button>
+    <h1 class="display center small">${esc(state.currentDayName)}</h1>
+    <span class="step-count">${state.stepIndex + 1}/${steps.length}</span>`;
+  run.querySelector('[data-slot=top]').innerHTML = vRunTop();
+  run.querySelector('[data-slot=ctl]').innerHTML = `
+    <button data-act="prevStep" aria-label="${esc(t('timer.prevBtn'))}">${icon('prev')}</button>
+    <button class="main" data-act="togglePause" aria-label="${esc(state.paused ? t('timer.resumeBtn') : t('timer.pauseBtn'))}">${icon(state.paused ? 'play' : 'pause', 28)}</button>
+    <button data-act="skipStep" aria-label="${esc(t('timer.skipBtn'))}">${icon('skip')}</button>`;
+  const w = document.getElementById('runWheel');
+  const keep = w.scrollTop;
+  w.innerHTML = vWheelCards();
+  w.scrollTop = keep;
+  if(fresh || wheel.follow){ wheel.lastSet = w.scrollTop; centerWheel(!fresh); }
+  wheelDepth();
+  updateFollowPill();
+  document.getElementById('sheetSlot').innerHTML = vSheet();
+  updateTimerDOM();
+}
+
+/* ---------- Karten-Rad ---------- */
+function mountWheel(){
+  const w = document.getElementById('runWheel');
+  wheel.follow = true; wheel.userAt = 0; wheel.lastSet = -99;
+  clearTimeout(wheel.idle);
+  // Nur echtes Scrollen durch den Nutzer (Finger, Mausrad, Tastatur) zaehlt - nicht das Verschieben,
+  // wenn sich die Hoehe der oberen Karte aendert.
+  const mark = () => { wheel.userAt = performance.now(); };
+  ['wheel', 'touchstart', 'touchmove', 'pointerdown', 'keydown'].forEach(ev => w.addEventListener(ev, mark, { passive: true }));
+  w.addEventListener('scroll', () => {
+    wheelDepth();
+    if(wheel.programmatic || performance.now() - wheel.userAt > 1200 || Math.abs(w.scrollTop - wheel.lastSet) < 2) return;
+    wheel.follow = false;
+    updateFollowPill();
+    clearTimeout(wheel.idle);
+    wheel.idle = setTimeout(() => { wheel.follow = true; centerWheel(true); updateFollowPill(); }, 5000);
+  }, { passive: true });
+  if(wheel.resize) wheel.resize.disconnect();
+  // Groessenaenderung (Drehen, Hoehe der oberen Karte): wieder mittig setzen.
+  if(window.ResizeObserver){
+    wheel.resize = new ResizeObserver(() => { if(wheel.follow) centerWheel(false); else wheelDepth(); });
+    wheel.resize.observe(w);
+  }
+}
+function wheelTarget(){
+  const w = document.getElementById('runWheel'), pos = runPos();
+  return w && w.querySelector(pos.restAfter != null ? `[data-gap="${pos.restAfter}"]` : `[data-ex="${pos.exIdx}"]`);
+}
+function centerWheel(smooth){
+  const w = document.getElementById('runWheel'), target = wheelTarget();
+  if(!w || !target) return;
+  // Abstand ueber getBoundingClientRect - beide Werte haben so denselben Bezugspunkt.
+  const wr = w.getBoundingClientRect(), tr = target.getBoundingClientRect();
+  const to = Math.max(0, Math.min(w.scrollTop + (tr.top - wr.top) - (w.clientHeight - tr.height) / 2, w.scrollHeight - w.clientHeight));
+  wheel.programmatic = true;
+  clearTimeout(wheel.anim);
+  const done = () => { clearTimeout(wheel.progT); wheel.progT = setTimeout(() => { wheel.programmatic = false; }, 60); };
+  if(!smooth || matchMedia('(prefers-reduced-motion: reduce)').matches){
+    w.scrollTop = to; wheel.lastSet = w.scrollTop; wheelDepth(); done();
+    return;
+  }
+  // Eigene Animation per setTimeout: scrollTo({behavior:'smooth'}) wird von manchen Browsern abgebrochen,
+  // und requestAnimationFrame steht, wenn der Browser Frames drosselt.
+  const from = w.scrollTop, startAt = performance.now();
+  const stepFn = () => {
+    const k = Math.min(1, (performance.now() - startAt) / 450), e = 1 - Math.pow(1 - k, 3);
+    w.scrollTop = from + (to - from) * e;
+    wheel.lastSet = w.scrollTop;
+    wheelDepth();
+    if(k < 1) wheel.anim = setTimeout(stepFn, 16); else done();
+  };
+  wheel.anim = setTimeout(stepFn, 0);
+}
+// Tiefe: je weiter eine Karte von der Mitte weg ist, desto kleiner und blasser.
+function wheelDepth(){
+  const w = document.getElementById('runWheel');
+  if(!w) return;
+  const wr = w.getBoundingClientRect(), mid = wr.top + wr.height / 2, half = Math.max(1, wr.height / 2);
+  w.querySelectorAll('.wcard, .wgap').forEach(c => {
+    const r = c.getBoundingClientRect();
+    const d = Math.min(1, Math.abs(r.top + r.height / 2 - mid) / half);
+    c.style.transform = `scale(${1 - d * 0.12})`;
+    c.style.opacity = String(1 - d * 0.6);
+  });
+}
+function updateFollowPill(){
+  const pill = document.getElementById('followPill');
+  if(pill) pill.hidden = wheel.follow;
+}
+
 function updateSoundHint(){
   const hint = document.getElementById('soundHint');
   if(hint) hint.hidden = !(state.running && state.plan.soundOn && !audioWorking());
@@ -1260,18 +1408,17 @@ function updateTimerDOM(){
   updateSoundHint();
   const s = steps[state.stepIndex];
   const rem = remainingPrecise();
+  const stepFrac = s.seconds > 0 ? Math.min(1, 1 - rem / s.seconds) : 1;
   clk.textContent = formatClock(Math.ceil(rem));
+  document.getElementById('runRing').style.strokeDashoffset = String(RING_C * (1 - stepFrac));
   const elapsed = stepStartOffsets[state.stepIndex] + (s.seconds - rem);
-  document.getElementById('runBar').style.width = (elapsed / Math.max(1, stepsTotalSeconds) * 100) + '%';
-  document.getElementById('runElapsed').textContent = t('timer.elapsed', {time: formatClock(elapsed)});
-  document.getElementById('runLeft').textContent = t('timer.left', {time: formatClock(stepsTotalSeconds - elapsed)});
+  document.getElementById('runTotalBar').style.width = (elapsed / Math.max(1, stepsTotalSeconds) * 100) + '%';
+  document.getElementById('runElapsed').textContent = formatClock(elapsed);
+  document.getElementById('runLeft').textContent = formatClock(stepsTotalSeconds - elapsed);
+  // Letzte 5 Sekunden: Zahl wird rot und pulsiert - auch aus der Entfernung erkennbar.
+  document.getElementById('run').classList.toggle('final', !state.paused && rem > 0 && rem <= 5);
   const pill = document.getElementById('livePill');
-  if(pill && s.mode === 'exercise') pill.style.width = ((1 - rem / Math.max(1, s.seconds)) * 100) + '%';
-}
-function scrollRunTrack(){
-  const track = document.getElementById('runTrack');
-  const cur = document.getElementById('curEx') || (track && track.querySelector('.gap.cur'));
-  if(track && cur) track.scrollTop = Math.max(0, cur.offsetTop - track.offsetTop - 12);
+  if(pill && s.mode === 'exercise') pill.style.width = (stepFrac * 100) + '%';
 }
 
 /* ---------- Nach dem Training ---------- */
@@ -1495,6 +1642,7 @@ const ACTIONS = {
   // Training
   enableSound(){ setTimeout(() => { beep(880, 140, 0.5); updateSoundHint(); }, 150); },
   start(){ const d = activeDay(); if(d && d.exercises.length) startTimer(d); },
+  wheelBack(){ wheel.follow = true; clearTimeout(wheel.idle); centerWheel(true); updateFollowPill(); },
   togglePause(){ togglePause(); },
   skipStep(){ skipStep(); },
   prevStep(){ prevStep(); },

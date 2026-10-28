@@ -285,5 +285,12 @@
   "finished.next": "Up next: {name}",
   "ex.setPauseLabel": "Rest between sets",
   "ex.pauseAfterLabel": "Rest afterwards",
-  "timer.soundBlocked": "Sound is blocked – tap here to turn it back on"
+  "timer.soundBlocked": "Sound is blocked – tap here to turn it back on",
+  "wheel.done": "Done",
+  "wheel.now": "Now · set {set} of {total}",
+  "wheel.soon": "Up next",
+  "wheel.next": "Next",
+  "wheel.later": "Later",
+  "wheel.back": "Back to current exercise",
+  "timer.overallLabel": "Total time: done and remaining"
 }

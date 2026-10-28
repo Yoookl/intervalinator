@@ -285,5 +285,12 @@
   "finished.next": "Als Nächstes: {name}",
   "ex.setPauseLabel": "Satzpause",
   "ex.pauseAfterLabel": "Pause danach",
-  "timer.soundBlocked": "Ton ist blockiert – hier tippen zum Aktivieren"
+  "timer.soundBlocked": "Ton ist blockiert – hier tippen zum Aktivieren",
+  "wheel.done": "Erledigt",
+  "wheel.now": "Jetzt · Satz {set} von {total}",
+  "wheel.soon": "Gleich",
+  "wheel.next": "Danach",
+  "wheel.later": "Später",
+  "wheel.back": "Zur aktuellen Übung",
+  "timer.overallLabel": "Gesamtzeit: trainiert und verbleibend"
 }

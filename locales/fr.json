@@ -285,5 +285,12 @@
   "finished.next": "Ensuite : {name}",
   "ex.setPauseLabel": "Pause entre séries",
   "ex.pauseAfterLabel": "Pause après",
-  "timer.soundBlocked": "Le son est bloqué – touche ici pour le réactiver"
+  "timer.soundBlocked": "Le son est bloqué – touche ici pour le réactiver",
+  "wheel.done": "Fait",
+  "wheel.now": "Maintenant · série {set} sur {total}",
+  "wheel.soon": "Juste après",
+  "wheel.next": "Ensuite",
+  "wheel.later": "Plus tard",
+  "wheel.back": "Revenir à l’exercice en cours",
+  "timer.overallLabel": "Temps total : effectué et restant"
 }

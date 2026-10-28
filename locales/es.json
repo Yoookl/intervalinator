@@ -285,5 +285,12 @@
   "finished.next": "Lo siguiente: {name}",
   "ex.setPauseLabel": "Descanso entre series",
   "ex.pauseAfterLabel": "Descanso después",
-  "timer.soundBlocked": "El sonido está bloqueado – toca aquí para activarlo"
+  "timer.soundBlocked": "El sonido está bloqueado – toca aquí para activarlo",
+  "wheel.done": "Hecho",
+  "wheel.now": "Ahora · serie {set} de {total}",
+  "wheel.soon": "Enseguida",
+  "wheel.next": "Después",
+  "wheel.later": "Más tarde",
+  "wheel.back": "Volver al ejercicio actual",
+  "timer.overallLabel": "Tiempo total: hecho y restante"
 }

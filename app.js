@@ -201,17 +201,19 @@ const LEGACY_MUSCLE_MAP = {
   "Beine":"legs", "Bauch":"abs", "Ganzkörper":"fullbody", "Cardio":"cardio", "Sonstiges":"other"
 };
 
-const CURRENT_PLAN_SCHEMA_VERSION = 5;
+const CURRENT_PLAN_SCHEMA_VERSION = 6;
+const DEFAULT_GROUP_SWITCH_SECONDS = 10;
+const DEFAULT_STRENGTH_REST_SECONDS = 120; // Studien sprechen fuer Kraft und Muskelaufbau eher fuer Pausen ab 2 Minuten
 const DEFAULT_WARMUP_SECONDS = 60;
 const DEFAULT_STRETCH_SECONDS = 120;
 
 function makeExercise(name, muscle, sets, seconds){
-  return { name, muscle, sets, seconds, pauseAfterOverride:null, setPauseOverride:null };
+  return { name, muscle, sets, seconds, pauseAfterOverride:null, setPauseOverride:null, groupId:null };
 }
 // Aufwaermen/Dehnen sind bewusst ganz normale Uebungen (kein Sonderfall) -
 // vorbelegt mit 1 Satz und 60/120 Sek., aber genauso frei editier-/loesch-/verschiebbar wie jede andere.
 function makeDay(name, exercises){
-  return { name, exercises: [
+  return { name, type:'interval', exercises: [
     makeExercise("Aufwärmen", "warmup", 1, DEFAULT_WARMUP_SECONDS),
     ...exercises,
     makeExercise("Dehnen", "stretch", 1, DEFAULT_STRETCH_SECONDS),
@@ -224,13 +226,16 @@ const DEFAULT_PLAN = {
   schemaVersion: CURRENT_PLAN_SCHEMA_VERSION,
   setPauseSeconds: 60,
   pauseSeconds: 15,
+  groupSwitchSeconds: DEFAULT_GROUP_SWITCH_SECONDS,
+  strengthRestSeconds: DEFAULT_STRENGTH_REST_SECONDS,
   soundOn: true,
-  days: []
+  days: [],
+  myExercises: []
 };
 
 const state = {
   plan: deepClone(DEFAULT_PLAN),
-  screen: 'main', // 'main' (Tabs) | 'onboarding' | 'finished'
+  screen: 'main', // 'main' (Tabs) | 'onboarding' | 'strength' | 'finished'
   activeDayId: null, // im Training-Tab gewaehlter Tag (null = der faellige)
   running: false,
   stepIndex: 0,
@@ -304,6 +309,20 @@ function migratePlan(plan){
     });
     version = 5;
   }
+  if(version < 6){
+    // Neu: Trainingsart je Tag, Gruppen und eine eigene Uebungsliste. Bestehende Tage bleiben Intervall-Tage.
+    if(plan.groupSwitchSeconds == null) plan.groupSwitchSeconds = DEFAULT_GROUP_SWITCH_SECONDS;
+    if(plan.strengthRestSeconds == null) plan.strengthRestSeconds = DEFAULT_STRENGTH_REST_SECONDS;
+    plan.myExercises = plan.myExercises || [];
+    (plan.days || []).forEach(d => {
+      d.type = d.type || 'interval';
+      (d.exercises || []).forEach(ex => {
+        if(ex.groupId === undefined) ex.groupId = null;
+        upsertMyExercise(plan, ex);
+      });
+    });
+    version = 6;
+  }
   plan.schemaVersion = CURRENT_PLAN_SCHEMA_VERSION;
   return plan;
 }
@@ -343,6 +362,8 @@ async function persistPlan(){
 function showSaveStatus(ok){
   const t_ = document.getElementById('saveToast');
   if(!t_) return;
+  // Ein gerade gezeigter Hinweis (showToast) soll nicht sofort von "Gespeichert" ersetzt werden.
+  if(ok && Date.now() < (showToast.until || 0)) return;
   t_.textContent = ok ? t('common.save.ok') : t('common.save.fail');
   t_.style.color = ok ? '' : 'var(--danger)';
   t_.classList.add('show');
@@ -562,6 +583,7 @@ async function runGeneration(){
   }
   state.plan.days = generatePlanDays(onboarding, library);
   ensureIds();
+  state.plan.days.forEach(d => d.exercises.forEach(ex => upsertMyExercise(state.plan, ex)));
   onboarding.completed = true;
   onboardingGenerating = false;
   persistOnboarding();
@@ -755,7 +777,8 @@ function onPageVisible(){
   if(document.visibilityState !== 'visible') return;
   audioClockCheck = null;
   tryResumeAudio();
-  if(state.running && !wakeLockSentinel) requestWakeLock();
+  if((state.running || sr) && !wakeLockSentinel) requestWakeLock();
+  if(sr) updateStrengthDOM();
   // Sofort aufholen statt auf den naechsten (evtl. verzoegerten) Intervall-Tick zu warten,
   // damit der Timer nach Hintergrund/Sperre nicht "eingefroren" wirkt.
   if(state.running && !state.paused) tick();
@@ -776,24 +799,31 @@ let stepsTotalSeconds = 0;
 function buildSteps(day){
   const s = [];
   const exercises = day.exercises;
-  exercises.forEach((ex, exIdx) => {
-    const sets = Math.max(1, ex.sets || 1);
-    const secs = Math.max(1, ex.seconds || 1);
-    for(let set=1; set<=sets; set++){
-      s.push({ mode:'exercise', seconds: secs, name: ex.name || t('exercise.unnamed'), muscle: ex.muscle, exIdx, exNum: exIdx+1, totalEx: exercises.length, setNum: set, totalSets: sets });
-      const isLastOverall = (exIdx === exercises.length-1) && (set === sets);
-      if(!isLastOverall){
-        const movingToNextExercise = (set === sets);
-        const pauseLen = Math.max(0, movingToNextExercise ? effectivePauseAfter(ex) : effectiveSetPause(ex));
-        // kind/afterExIdx: damit die Spur im Training weiss, ob Satzpause oder Uebungswechsel ist.
-        s.push({ mode:'pause', seconds: pauseLen, kind: movingToNextExercise ? 'exercise' : 'set', afterExIdx: exIdx });
-      }
+  const blocks = blocksOf(day);
+  blocks.forEach((block, bIdx) => {
+    // Eine Gruppe laeuft reihum (a-b-a-b): pro Runde jede Uebung einmal.
+    const rounds = Math.max(1, exercises[block[0]].sets || 1);
+    for(let set = 1; set <= rounds; set++){
+      block.forEach((exIdx, mIdx) => {
+        const ex = exercises[exIdx];
+        const secs = Math.max(1, ex.seconds || 1);
+        s.push({ mode:'exercise', seconds: secs, name: ex.name || t('exercise.unnamed'), muscle: ex.muscle, exIdx, exNum: exIdx+1, totalEx: exercises.length, setNum: set, totalSets: rounds, inGroup: block.length > 1 });
+        const lastMember = mIdx === block.length - 1, lastRound = set === rounds;
+        if(bIdx === blocks.length - 1 && lastMember && lastRound) return;
+        // kind/afterExIdx: damit die Anzeige weiss, was fuer eine Pause gerade laeuft.
+        if(lastMember && lastRound) s.push({ mode:'pause', seconds: Math.max(0, effectivePauseAfter(ex, day)), kind:'exercise', afterExIdx: exIdx });
+        else s.push({ mode:'pause', seconds: Math.max(0, effectiveSetPause(ex, day)), kind: block.length === 1 ? 'set' : (lastMember ? 'round' : 'switch'), afterExIdx: exIdx });
+      });
     }
   });
   return s;
 }
 
 function dayTotalSeconds(day){
+  if(dayType(day) === 'strength'){
+    // Nur eine Schaetzung: rund 40 Sekunden pro Satz plus Pause.
+    return strengthQueue(day).reduce((a, x) => a + 40 + effectiveSetPause(x.ex, day), 0);
+  }
   return buildSteps(day).reduce((a,s) => a + s.seconds, 0);
 }
 
@@ -827,11 +857,131 @@ function esc(s){
   return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
-function effectiveSetPause(ex){
-  return (ex.setPauseOverride != null) ? ex.setPauseOverride : state.plan.setPauseSeconds;
+function dayType(day){ return day && day.type === 'strength' ? 'strength' : 'interval'; }
+
+/* Gruppen: direkt aufeinanderfolgende Uebungen mit gleicher groupId bilden eine Gruppe.
+   blocksOf liefert die Reihenfolge als Listen von Uebungs-Indizes (einzelne Uebung = Liste mit einem Eintrag). */
+function blocksOf(day){
+  const blocks = [];
+  day.exercises.forEach((ex, i) => {
+    const last = blocks[blocks.length - 1];
+    if(ex.groupId && last && day.exercises[last[last.length - 1]].groupId === ex.groupId) last.push(i);
+    else blocks.push([i]);
+  });
+  return blocks;
 }
-function effectivePauseAfter(ex){
+function groupInfo(day, i){
+  let letterIdx = 0;
+  for(const block of blocksOf(day)){
+    const grouped = block.length > 1;
+    if(block.includes(i)){
+      return { inGroup: grouped, letter: grouped ? String.fromCharCode(65 + letterIdx) : '', pos: block.indexOf(i) + 1, size: block.length,
+               first: block[0] === i, last: block[block.length - 1] === i, block };
+    }
+    if(grouped) letterIdx++;
+  }
+  return { inGroup: false, letter: '', pos: 1, size: 1, first: true, last: true, block: [i] };
+}
+// Haelt Gruppen gueltig: nur zusammenhaengend, mindestens zwei Uebungen, gleiche Rundenzahl.
+function normalizeGroups(day){
+  const list = day.exercises, seen = new Set();
+  let i = 0;
+  while(i < list.length){
+    const g = list[i].groupId;
+    if(!g){ i++; continue; }
+    if(seen.has(g)){ list[i].groupId = null; i++; continue; }
+    let j = i;
+    while(j + 1 < list.length && list[j + 1].groupId === g) j++;
+    seen.add(g);
+    if(j === i) list[i].groupId = null;
+    else for(let k = i + 1; k <= j; k++) list[k].sets = list[i].sets;
+    i = j + 1;
+  }
+}
+
+function defaultSetPause(ex, day){
+  const strength = dayType(day) === 'strength';
+  const i = day ? day.exercises.indexOf(ex) : -1;
+  const g = i >= 0 ? groupInfo(day, i) : null;
+  if(g && g.inGroup && !g.last) return strength ? 0 : state.plan.groupSwitchSeconds;
+  return strength ? state.plan.strengthRestSeconds : state.plan.setPauseSeconds;
+}
+// In einer Gruppe ist das die Pause nach der Uebung innerhalb der Runde (bzw. nach der Runde bei der letzten Uebung).
+function effectiveSetPause(ex, day){
+  return (ex.setPauseOverride != null) ? ex.setPauseOverride : defaultSetPause(ex, day);
+}
+function effectivePauseAfter(ex, day){
+  if(dayType(day) === 'strength') return effectiveSetPause(ex, day);
   return (ex.pauseAfterOverride != null) ? ex.pauseAfterOverride : state.plan.pauseSeconds;
+}
+
+/* Eigene Uebungen: alles, was man im Plan benutzt, landet in plan.myExercises und steht beim Hinzufuegen ganz oben.
+   Eindeutig ueber den Namen (ohne Gross-/Kleinschreibung), Aufwaermen und Dehnen zaehlen nicht. */
+function myKey(name){ return String(name || '').trim().toLowerCase(); }
+function upsertMyExercise(plan, ex){
+  const key = myKey(ex.name);
+  if(!key || ex.muscle === 'warmup' || ex.muscle === 'stretch') return null;
+  plan.myExercises = plan.myExercises || [];
+  let my = plan.myExercises.find(m => myKey(m.name) === key);
+  if(!my){ my = { id: uid(), name: ex.name.trim(), last: null }; plan.myExercises.push(my); }
+  Object.assign(my, { muscle: ex.muscle, sets: ex.sets, seconds: ex.seconds, usedAt: Date.now() });
+  if(ex.reps != null) Object.assign(my, { reps: ex.reps, weight: ex.weight || 0, unit: ex.unit || 'reps' });
+  if(ex.setPlan) my.setPlan = ex.setPlan.map(p => ({ r: p.r, w: p.w || 0 }));
+  else delete my.setPlan;
+  return my;
+}
+function rememberExercise(ex){ return upsertMyExercise(state.plan, ex); }
+function findMyExercise(name){
+  const key = myKey(name);
+  return (state.plan.myExercises || []).find(m => myKey(m.name) === key) || null;
+}
+
+/* Vorschlaege fuer die naechste Muskelgruppe. Grundlage: Gegenspieler-Paare halten in Gruppen das Trainingsvolumen,
+   aehnliche Muskeln senken es; rund 48 Stunden Erholung je Muskel als Faustregel; Saetze pro Woche als Ausgleich. */
+const ANTAGONISTS = { chest:['back'], back:['chest'], biceps:['triceps'], triceps:['biceps'], shoulders:['back'], legs:['abs'], abs:['legs'] };
+const SYNERGISTS = { chest:['triceps','shoulders'], back:['biceps'], shoulders:['triceps'], legs:['abs'] };
+const SUGGESTABLE_MUSCLES = ['chest','back','shoulders','biceps','triceps','legs','abs'];
+function muscleHistory(){
+  const sets = {}, lastAt = {};
+  const weekAgo = Date.now() - 7 * 864e5;
+  completedSessions().forEach(s => {
+    const when = sessionDate(s);
+    (s.exercises || []).forEach(e => {
+      if(!e.muscle) return;
+      if(when >= weekAgo) sets[e.muscle] = (sets[e.muscle] || 0) + (e.reachedSets || 0);
+      if(!lastAt[e.muscle] || when > lastAt[e.muscle]) lastAt[e.muscle] = when;
+    });
+  });
+  return { sets, lastAt };
+}
+function suggestMuscles(day, anchor, asGroup){
+  const inDay = {};
+  day.exercises.forEach(e => { inDay[e.muscle] = (inDay[e.muscle] || 0) + 1; });
+  const hist = muscleHistory();
+  return SUGGESTABLE_MUSCLES.map(m => {
+    let score = 0, reason = '';
+    const anchorName = anchor ? t('muscle.' + anchor.muscle) : '';
+    if(anchor && (ANTAGONISTS[anchor.muscle] || []).includes(m)){ score += asGroup ? 6 : 3; reason = t('suggest.antagonist', {muscle: anchorName}); }
+    else if(anchor && !asGroup && (SYNERGISTS[anchor.muscle] || []).includes(m)){ score += 3; reason = t('suggest.synergist', {muscle: anchorName}); }
+    if(anchor && asGroup && anchor.muscle === m) score -= 4;
+    if(!inDay[m]){ score += 2; if(!reason) reason = t('suggest.missing'); }
+    if(inDay[m] >= 2) score -= 3;
+    const last = hist.lastAt[m];
+    const hoursAgo = last ? (Date.now() - last) / 36e5 : null;
+    if(hoursAgo != null && hoursAgo < 48){ score -= 2; if(reason === t('suggest.missing')) reason = ''; }
+    else if((hist.sets[m] || 0) < 6){ score += 1; if(!reason) reason = t('suggest.lowWeek', {n: hist.sets[m] || 0}); }
+    return { muscle: m, score, reason };
+  }).filter(x => x.score > 0 && x.reason).sort((a, b) => b.score - a.score).slice(0, 3);
+}
+function showToast(msg){
+  const el = document.getElementById('saveToast');
+  if(!el) return;
+  showToast.until = Date.now() + 2200;
+  el.textContent = msg;
+  el.style.color = '';
+  el.classList.add('show');
+  clearTimeout(showSaveStatus._t);
+  showSaveStatus._t = setTimeout(() => el.classList.remove('show'), 2200);
 }
 
 const MUSCLE_HUES = { warmup:60, chest:20, back:250, shoulders:205, biceps:290, triceps:320, legs:120, abs:160, fullbody:180, cardio:5, stretch:340, other:260 };
@@ -848,7 +998,7 @@ const ICONS = {
   trash:'<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/>', up:'<path d="M6 15l6-6 6 6"/>', down:'<path d="M6 9l6 6 6-6"/>',
   clock:'<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>', more:`<circle cx="5" cy="12" r="1.8" ${ICON_FILL}/><circle cx="12" cy="12" r="1.8" ${ICON_FILL}/><circle cx="19" cy="12" r="1.8" ${ICON_FILL}/>`,
   spark:'<path d="M12 3v4M12 17v4M3 12h4M17 12h4M6 6l2.5 2.5M15.5 15.5L18 18M6 18l2.5-2.5M15.5 8.5L18 6"/>',
-  sound:'<path d="M4 9v6h4l5 4V5L8 9z"/><path d="M16.5 8.5a5 5 0 0 1 0 7"/>', logout:'<path d="M15 4h4v16h-4M10 8l-4 4 4 4M6 12h10"/>', search:'<circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4-4"/>', flag:'<path d="M5 21V4M5 4h11l-2 4 2 4H5"/>'
+  sound:'<path d="M4 9v6h4l5 4V5L8 9z"/><path d="M16.5 8.5a5 5 0 0 1 0 7"/>', link:'<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>', logout:'<path d="M15 4h4v16h-4M10 8l-4 4 4 4M6 12h10"/>', search:'<circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4-4"/>', flag:'<path d="M5 21V4M5 4h11l-2 4 2 4H5"/>'
 };
 function icon(name, size){
   const s = size || 22;
@@ -861,6 +1011,8 @@ const ui = {
   editExId: null,
   libFilter: '',
   libQuery: '',
+  libGroupWith: null,  // Uebung, mit der eine neue Uebung gruppiert werden soll
+  libMore: false,      // Bibliothek aufgeklappt
   confirmDeleteDay: false,
   setupOpen: 0,
   finished: null,      // { summary, day } nach einem Training
@@ -907,7 +1059,16 @@ function relDay(date){
 }
 function minutesLabel(sec){ return t('common.minutes', {n: Math.max(1, Math.round(sec / 60))}); }
 function daySets(day){ return day.exercises.reduce((a, e) => a + Math.max(1, e.sets || 1), 0); }
-function doseLabel(ex){
+function doseLabel(ex, day){
+  if(dayType(day) === 'strength'){
+    if(ex.setPlan && ex.setPlan.length){
+      const rs = ex.setPlan.map(p => p.r), ws = ex.setPlan.map(p => p.w || 0);
+      const range = a => Math.min(...a) === Math.max(...a) ? `${a[0]}` : `${Math.min(...a)}–${Math.max(...a)}`;
+      return `${ex.sets} × ${range(rs)}${ex.unit === 'seconds' ? ' s' : ''}${Math.max(...ws) > 0 ? ' · ' + range(ws).replace(/\./g, currentLanguage === 'en' ? '.' : ',') + ' kg' : ''}`;
+    }
+    const amount = ex.unit === 'seconds' ? `${ex.reps} s` : `${ex.reps}`;
+    return `${ex.sets} × ${amount}${ex.weight > 0 ? ' · ' + fmtKg(ex.weight) : ''}`;
+  }
   if(ex.sets > 1) return `${ex.sets} × ${ex.seconds} s`;
   return ex.seconds >= 60 ? formatClock(ex.seconds) + ' ' + t('common.minutesSuffix') : `${ex.seconds} s`;
 }
@@ -935,6 +1096,7 @@ function render(){
 
   // Laufendes Training: nur Teile aktualisieren, damit das Karten-Rad seine Scrollposition behaelt.
   if(authReady && authUser && state.running){ renderRun(app); return; }
+  if(authReady && authUser && state.screen === 'strength' && sr){ renderStrength(app); return; }
 
   let html;
   if(!authReady) html = `<div class="center-screen"><div class="muted">${esc(t('common.loading'))}</div></div>`;
@@ -996,17 +1158,24 @@ function vTrain(){
   }
   const d = activeDay(), due = dueDay();
   const total = dayTotalSeconds(d);
+  const resume = srSaved();
   return `
   <header class="head"><h1 class="display">${esc(t('train.title'))}</h1></header>
   <div class="days" role="tablist" aria-label="${esc(t('train.daysLabel'))}">
     ${days.map(x => `
       <button class="day-chip ${x.id === d.id ? 'on' : ''}" role="tab" aria-selected="${x.id === d.id}" data-act="pickDay" data-arg="${x.id}">
         ${due && x.id === due.id ? `<span class="due">${esc(t('train.due'))}</span>` : ''}
-        <b>${esc(x.name || t('main.newDayName'))}</b><span>${esc(minutesLabel(dayTotalSeconds(x)))}</span>
+        <b>${esc(x.name || t('main.newDayName'))}</b><span>${dayType(x) === 'strength' ? esc(t('train.typeStrength')) + ' · ' : ''}${esc(minutesLabel(dayTotalSeconds(x)))}</span>
       </button>`).join('')}
     <button class="day-chip add" data-act="addDay" aria-label="${esc(t('train.addDay'))}">${icon('plus')}</button>
   </div>
   <div class="screen">
+    ${resume ? `
+      <div class="hint-card">
+        <b>${esc(t('strength.resumeTitle', {name: resume.day.name}))}</b>
+        <p>${esc(t('strength.resumeText', {time: formatClock((Date.now() - resume.saved.startedAt) / 1000)}))}</p>
+        <div class="row-btns"><button class="btn btn-small btn-ghost" data-act="discardStrength">${esc(t('strength.discard'))}</button><button class="btn btn-small btn-primary" data-act="resumeStrength">${esc(t('strength.resume'))}</button></div>
+      </div>` : ''}
     ${!onboarding.completed && !onboardingCardDismissed ? `
       <div class="hint-card">
         <b>${esc(t('onboarding.introTitle'))}</b>
@@ -1023,41 +1192,55 @@ function vTrain(){
     <button class="add-btn" data-act="openLibrary">${icon('plus', 18)} ${esc(t('train.addExercise'))}</button>
   </div>
   <div class="startbar">
-    <button class="btn btn-primary btn-start" data-act="start" ${d.exercises.length ? '' : 'disabled'}>${icon('play', 22)} ${esc(t('train.start', {name: d.name}))} <small>· ${esc(minutesLabel(total))}</small></button>
+    <button class="btn btn-primary btn-start" data-act="start" ${d.exercises.length ? '' : 'disabled'}>${icon('play', 22)} ${esc(t('train.start', {name: d.name}))} <small>· ${dayType(d) === 'strength' ? '~' : ''}${esc(minutesLabel(total))}</small></button>
   </div>`;
 }
 
-/* Kompakte Spur: eine Zeile pro Uebung, dazwischen die Pause.
-   pos (nur im Training) = { exIdx, set, setDone, restAfter, all } markiert, wo man gerade steht. */
+/* Kompakte Spur: eine Zeile pro Uebung, dazwischen die Pause. Gruppen stehen in einem gemeinsamen Rahmen.
+   pos (nur im Abschluss-Bildschirm) = { exIdx, all } markiert, was erledigt ist. */
 function vTrack(d, pos){
   const live = !!pos;
+  const strength = dayType(d) === 'strength';
+  const linkable = i => {
+    const a = d.exercises[i], b = d.exercises[i + 1];
+    return !live && b && ![a.muscle, b.muscle].some(m => m === 'warmup' || m === 'stretch');
+  };
   return `<ol class="track ${live ? 'live' : ''}">${d.exercises.map((ex, i) => {
-    let st = '';
-    if(pos){ if(pos.all || i < pos.exIdx) st = 'done'; else if(i === pos.exIdx && pos.restAfter == null) st = 'cur'; }
-    const sets = Math.max(1, ex.sets || 1);
-    const pills = st === 'cur' ? `<span class="pills">${Array.from({length: sets}, (_, k) => {
-      const done = k + 1 < pos.set || (k + 1 === pos.set && pos.setDone);
-      return `<i class="${done ? 'done' : ''}">${k + 1 === pos.set && !pos.setDone ? '<b id="livePill"></b>' : ''}</i>`;
-    }).join('')}</span>` : '';
-    const setPause = sets > 1 ? `${t('ex.setPauseShort', {s: effectiveSetPause(ex)})}${ex.setPauseOverride != null ? ' · ' + t('ex.custom') : ''}` : '';
-    const row = `<li class="ex ${st}" ${st === 'cur' ? 'id="curEx"' : ''}>
+    const g = groupInfo(d, i);
+    const st = pos && (pos.all || i < pos.exIdx) ? 'done' : '';
+    const pause = effectiveSetPause(ex, d);
+    let pauseTxt = '';
+    if(!g.inGroup && ex.sets > 1 && !strength) pauseTxt = t('ex.setPauseShort', {s: pause}) + (ex.setPauseOverride != null ? ' · ' + t('ex.custom') : '');
+    if(g.inGroup && g.last) pauseTxt = t('group.roundPause', {s: pause});
+    const head = g.inGroup && g.first ? groupHead(d, g, ex, i, live) : '';
+    const row = `<li class="ex ${st} ${g.inGroup ? 'in-group' : ''}">
       <button class="ex-btn" ${live ? 'tabindex="-1"' : `data-act="editEx" data-arg="${ex.id}"`}>
-        <span class="node">${st === 'done' ? icon('check', 13) : i + 1}</span>
+        <span class="node">${st === 'done' ? icon('check', 13) : g.inGroup ? g.letter + g.pos : i + 1}</span>
         <span class="ex-main">
           <span class="ex-name">${esc(ex.name || t('exercise.namePlaceholder'))}</span>
-          <span class="ex-sub"><i style="background:${muscleColor(ex.muscle)}"></i>${esc(t('muscle.' + ex.muscle))}${setPause ? ' · ' + esc(setPause) : ''}</span>
-          ${pills}
+          <span class="ex-sub"><i style="background:${muscleColor(ex.muscle)}"></i>${esc(t('muscle.' + ex.muscle))}${pauseTxt ? ' · ' + esc(pauseTxt) : ''}</span>
         </span>
-        <span class="ex-dose">${esc(doseLabel(ex))}</span>
+        <span class="ex-dose">${esc(g.inGroup && !strength ? ex.seconds + ' s' : doseLabel(ex, d))}</span>
       </button>
     </li>`;
-    if(i === d.exercises.length - 1) return row;
-    const isRest = pos && pos.restAfter === i;
-    const gap = `<li class="gap ${isRest ? 'cur' : ''} ${pos && (pos.all || i < (pos.restAfter != null ? pos.restAfter : pos.exIdx)) ? 'done' : ''}">
-      <button ${live ? 'tabindex="-1"' : `data-act="editEx" data-arg="${ex.id}"`}>${icon('clock', 13)} ${esc(isRest ? t('track.restNow', {s: effectivePauseAfter(ex)}) : t('track.rest', {s: effectivePauseAfter(ex)}))}${ex.pauseAfterOverride != null ? ' · ' + esc(t('ex.custom')) : ''}</button>
+    if(i === d.exercises.length - 1) return head + row;
+    const sameGroup = g.inGroup && !g.last;
+    const gapText = sameGroup
+      ? (pause > 0 ? t('group.switch', {s: pause}) : t('group.direct'))
+      : t('track.rest', {s: effectivePauseAfter(ex, d)}) + (!strength && ex.pauseAfterOverride != null ? ' · ' + t('ex.custom') : '');
+    const gap = `<li class="gap ${sameGroup ? 'in-group' : ''} ${st}">
+      <button class="gap-pause" ${live ? 'tabindex="-1"' : `data-act="editEx" data-arg="${ex.id}"`}>${icon('clock', 13)} ${esc(gapText)}</button>
+      ${linkable(i) ? `<button class="gap-link ${sameGroup ? 'on' : ''}" data-act="toggleLink" data-arg="${i}" aria-pressed="${sameGroup}" aria-label="${esc(t(sameGroup ? 'group.unlink' : 'group.link'))}">${icon('link', 14)}<span>${esc(t(sameGroup ? 'group.unlinkShort' : 'group.linkShort'))}</span></button>` : ''}
     </li>`;
-    return row + gap;
+    return head + row + gap;
   }).join('')}</ol>`;
+}
+function groupHead(d, g, ex, i, live){
+  const muscles = g.block.map(k => d.exercises[k].muscle);
+  const similar = new Set(muscles).size < muscles.length;
+  return `<li class="group-head"><span class="group-badge">${g.letter}</span>
+    <span class="grow"><b>${esc(t('group.title', {n: ex.sets}))}</b>${!live && similar ? `<small>${esc(t('group.similarHint'))}</small>` : ''}</span>
+    ${live ? '' : `<button class="chip small" data-act="openLibraryForGroup" data-arg="${ex.id}">${icon('plus', 14)} ${esc(t('group.add'))}</button>`}</li>`;
 }
 
 /* ---------- Verlauf (Statistik) ---------- */
@@ -1099,7 +1282,7 @@ function vHistory(){
     <div class="cap">${esc(t('stats.recent'))}</div>
     ${done.length ? `<ul class="list">${done.slice(0, 12).map(s => {
       const d = sessionDate(s);
-      return `<li class="list-row"><div class="grow"><b>${esc(s.dayName || '')}</b><small>${esc(d.toLocaleDateString(currentLanguage, {weekday:'long', day:'numeric', month:'numeric'}))}</small></div>
+      return `<li class="list-row"><div class="grow"><b>${esc(s.dayName || '')}</b><small>${esc(d.toLocaleDateString(currentLanguage, {weekday:'long', day:'numeric', month:'numeric'}))}${s.type === 'strength' ? ' · ' + esc(t('train.typeStrength')) + (s.volumeKg ? ' · ' + Math.round(s.volumeKg).toLocaleString(currentLanguage) + ' kg' : '') : ''}</small></div>
         <span class="num">${esc(minutesLabel(s.elapsedSeconds || 0))}</span></li>`; }).join('')}</ul>`
       : `<div class="muted pad">${esc(t('history.empty'))}</div>`}
   </div>`;
@@ -1122,6 +1305,8 @@ function vProfile(){
     <ul class="list">
       <li class="list-row"><div class="grow"><b>${esc(t('profile.setPause'))}</b><small>${esc(t('profile.setPauseHint'))}</small></div>${vStepper('globalSetPause', state.plan.setPauseSeconds, ' s')}</li>
       <li class="list-row"><div class="grow"><b>${esc(t('profile.exercisePause'))}</b><small>${esc(t('profile.exercisePauseHint'))}</small></div>${vStepper('globalPause', state.plan.pauseSeconds, ' s')}</li>
+      <li class="list-row"><div class="grow"><b>${esc(t('profile.groupSwitch'))}</b><small>${esc(t('profile.groupSwitchHint'))}</small></div>${vStepper('globalGroupSwitch', state.plan.groupSwitchSeconds, ' s')}</li>
+      <li class="list-row"><div class="grow"><b>${esc(t('profile.strengthRest'))}</b><small>${esc(t('profile.strengthRestHint'))}</small></div>${vStepper('globalStrengthRest', state.plan.strengthRestSeconds, ' s')}</li>
       <li class="list-row"><div class="grow"><b>${esc(t('main.soundLabel'))}</b><small>${esc(t('profile.soundHint'))}</small></div>
         <button class="switch ${state.plan.soundOn ? 'on' : ''}" role="switch" aria-checked="${!!state.plan.soundOn}" data-act="toggleSound" aria-label="${esc(t('main.soundLabel'))}"></button></li>
       <li><button class="list-row" data-act="openSetup"><div class="grow"><b>${esc(t('onboarding.editLink'))}</b><small>${esc(t('profile.setupHint'))}</small></div>${icon('next', 18)}</button></li>
@@ -1200,6 +1385,9 @@ function runPos(){
   if(s.mode === 'exercise') return { exIdx: s.exIdx, set: s.setNum };
   if(s.mode === 'pause'){
     if(s.kind === 'exercise') return { exIdx: s.afterExIdx + 1, set: 1, restAfter: s.afterExIdx };
+    const next = steps[state.stepIndex + 1];
+    // Pause innerhalb einer Gruppe: Die naechste Uebung kommt schon in die Mitte.
+    if(s.kind === 'switch' || s.kind === 'round') return { exIdx: next.exIdx, set: next.setNum, soon: true };
     const prev = steps[state.stepIndex - 1];
     return { exIdx: s.afterExIdx, set: prev ? prev.setNum : 1, setDone: true };
   }
@@ -1244,17 +1432,17 @@ function vRunTop(){
   const after = steps[state.stepIndex + 1];
   let phase, title, sub;
   if(s.mode === 'exercise'){
-    phase = t('timer.setOf', {set: s.setNum, total: s.totalSets});
+    phase = t(s.inGroup ? 'wheel.roundOf' : 'timer.setOf', {set: s.setNum, total: s.totalSets});
     title = s.name;
     sub = `${t('muscle.' + s.muscle)} · ${after ? t('timer.thenPause', {s: after.seconds}) : t('timer.thenDone')}`;
   } else if(s.mode === 'pause'){
-    phase = s.kind === 'exercise' ? t('timer.exerciseChange') : t('timer.setPause');
+    phase = s.kind === 'exercise' ? t('timer.exerciseChange') : s.kind === 'switch' ? t('timer.groupSwitch') : s.kind === 'round' ? t('timer.roundPause') : t('timer.setPause');
     title = nxt ? t('timer.upNext', {name: nxt.name}) : '';
-    sub = nxt ? `${t('timer.setOf', {set: nxt.setNum, total: nxt.totalSets})} · ${nxt.seconds} s` : '';
+    sub = nxt ? `${t(nxt.inGroup ? 'wheel.roundOf' : 'timer.setOf', {set: nxt.setNum, total: nxt.totalSets})} · ${nxt.seconds} s` : '';
   } else {
     phase = t('timer.prepare');
     title = nxt ? t('timer.upNext', {name: nxt.name}) : '';
-    sub = nxt ? t('timer.setOf', {set: 1, total: nxt.totalSets}) : '';
+    sub = nxt ? t(nxt.inGroup ? 'wheel.roundOf' : 'timer.setOf', {set: 1, total: nxt.totalSets}) : '';
   }
   return `
     <div class="ring-box">
@@ -1275,28 +1463,38 @@ function vRunTop(){
 function vWheelCards(){
   const pos = runPos();
   const list = runDay.exercises;
+  // Erledigte Saetze je Uebung aus dem Ablauf zaehlen - in Gruppen wechseln sich die Uebungen ab.
+  const doneCounts = list.map(() => 0);
+  steps.slice(0, state.stepIndex).forEach(x => { if(x.mode === 'exercise') doneCounts[x.exIdx]++; });
+  const upcoming = nextExerciseStep(state.stepIndex);
   return list.map((ex, i) => {
     const sets = Math.max(1, ex.sets || 1);
-    const st = i < pos.exIdx ? 'done' : (i === pos.exIdx && pos.restAfter == null ? 'cur' : '');
-    const soon = i === pos.exIdx && pos.restAfter != null;
+    const g = groupInfo(runDay, i);
+    const isCur = i === pos.exIdx && pos.restAfter == null && !pos.soon;
+    const soon = i === pos.exIdx && (pos.restAfter != null || pos.soon);
+    const st = isCur ? 'cur' : doneCounts[i] >= sets ? 'done' : '';
     const label = st === 'done' ? t('wheel.done')
-      : st === 'cur' ? t('wheel.now', {set: pos.set, total: sets})
-      : soon ? t('wheel.soon') : i === pos.exIdx + 1 ? t('wheel.next') : t('wheel.later');
+      : st === 'cur' ? t(g.inGroup ? 'wheel.nowRound' : 'wheel.now', {set: pos.set, total: sets})
+      : soon ? t('wheel.soon') : upcoming && upcoming.exIdx === i ? t('wheel.next') : t('wheel.later');
     const pills = Array.from({length: sets}, (_, k) => {
-      const done = st === 'done' || (st === 'cur' && (k + 1 < pos.set || (k + 1 === pos.set && pos.setDone)));
       const isLive = st === 'cur' && k + 1 === pos.set && !pos.setDone && steps[state.stepIndex].mode === 'exercise';
-      return `<i class="${done ? 'done' : ''}">${isLive ? '<b id="livePill"></b>' : ''}</i>`;
+      return `<i class="${k < doneCounts[i] ? 'done' : ''}">${isLive ? '<b id="livePill"></b>' : ''}</i>`;
     }).join('');
-    const setPause = sets > 1 ? ` · ${t('ex.setPauseShort', {s: effectiveSetPause(ex)})}` : '';
-    const card = `<article class="wcard ${st} ${soon ? 'soon' : ''}" data-ex="${i}">
-      <div class="wtop"><span class="wlabel">${esc(label)}</span><span class="wnum">${i + 1}/${list.length}</span></div>
+    const pause = effectiveSetPause(ex, runDay);
+    const pauseTxt = g.inGroup ? (g.last ? ' · ' + t('group.roundPause', {s: pause}) : '') : sets > 1 ? ' · ' + t('ex.setPauseShort', {s: pause}) : '';
+    const dose = g.inGroup ? ex.seconds + ' s' : doseLabel(ex, runDay);
+    const card = `<article class="wcard ${st} ${soon ? 'soon' : ''} ${g.inGroup ? 'grp' : ''}" data-ex="${i}">
+      <div class="wtop"><span class="wlabel">${g.inGroup ? g.letter + g.pos + ' · ' : ''}${esc(label)}</span><span class="wnum">${i + 1}/${list.length}</span></div>
       <div class="wname">${st === 'done' ? icon('check', 16) : ''}${esc(ex.name || t('exercise.namePlaceholder'))}</div>
-      <div class="wsub"><i style="background:${muscleColor(ex.muscle)}"></i>${esc(t('muscle.' + ex.muscle))} · ${esc(doseLabel(ex))}${esc(setPause)}</div>
+      <div class="wsub"><i style="background:${muscleColor(ex.muscle)}"></i>${esc(t('muscle.' + ex.muscle))} · ${esc(dose)}${esc(pauseTxt)}</div>
       <div class="pills">${pills}</div>
     </article>`;
     if(i === list.length - 1) return card;
     const gapCur = pos.restAfter === i;
-    return card + `<div class="wgap ${gapCur ? 'cur' : ''}" data-gap="${i}">${icon('clock', 13)} ${esc(gapCur ? t('track.restNow', {s: effectivePauseAfter(ex)}) : t('track.rest', {s: effectivePauseAfter(ex)}))}</div>`;
+    const sameGroup = g.inGroup && !g.last;
+    const gapText = sameGroup ? (pause > 0 ? t('group.switch', {s: pause}) : t('group.direct'))
+      : gapCur ? t('track.restNow', {s: effectivePauseAfter(ex, runDay)}) : t('track.rest', {s: effectivePauseAfter(ex, runDay)});
+    return card + `<div class="wgap ${gapCur ? 'cur' : ''}" data-gap="${i}">${icon('clock', 13)} ${esc(gapText)}</div>`;
   }).join('');
 }
 function renderRun(app){
@@ -1353,7 +1551,13 @@ function mountWheel(){
   }
 }
 function wheelTarget(){
-  const w = document.getElementById('runWheel'), pos = runPos();
+  const w = document.getElementById('runWheel');
+  if(!w) return null; // Training schon beendet (z.B. spaeter Resize-Aufruf)
+  if(sr){
+    const cur = srCurrent();
+    return w && (cur ? w.querySelector(`[data-ex="${cur.exIdx}"]`) : w.querySelector('.wcard:last-of-type'));
+  }
+  const pos = runPos();
   return w && w.querySelector(pos.restAfter != null ? `[data-gap="${pos.restAfter}"]` : `[data-ex="${pos.exIdx}"]`);
 }
 function centerWheel(smooth){
@@ -1423,6 +1627,7 @@ function updateTimerDOM(){
 
 /* ---------- Nach dem Training ---------- */
 function vFinished(){
+  if(ui.finished.strength) return vFinishedStrength();
   const { summary, day } = ui.finished;
   const full = summary.completionFraction >= 0.999;
   const reached = summary.exercises.reduce((a, e) => a + e.reachedSets, 0);
@@ -1459,20 +1664,48 @@ function vSheet(){
         ${vStepper(act, value, ' s')}
         <button class="chip small ${isCustom ? '' : 'on'}" data-act="${resetAct}" aria-pressed="${!isCustom}">${esc(t('ex.default'))}</button>
       </div>`;
+    const strength = dayType(d) === 'strength';
+    const g = groupInfo(d, i);
+    const setsCaption = g.inGroup ? t('group.rounds') : t('exercise.sets');
+    const setPauseLabel = strength ? t('strength.restLabel') : !g.inGroup ? t('ex.setPauseLabel') : g.last ? t('group.roundPauseLabel') : t('group.switchLabel');
+    const setPauseHint = ex.setPauseOverride != null ? t('ex.customHint') : t('ex.defaultHint', {s: defaultSetPause(ex, d)});
+    const lastTime = strength ? lastTimeLabel(ex) : '';
+    const suggestion = strength ? strengthSuggestion(ex) : null;
+    if(strength) syncSetPlan(ex);
+    const perSet = strength && !!ex.setPlan;
     return wrap(`
-      <div class="cap">${esc(t('ex.position', {n: i + 1, total: d.exercises.length}))}</div>
+      <div class="cap">${esc(t('ex.position', {n: i + 1, total: d.exercises.length}))}${g.inGroup ? ' · ' + esc(t('group.member', {tag: g.letter + g.pos})) : ''}</div>
       <input class="name-input" type="text" id="exName" data-input="exName" placeholder="${esc(t('exercise.namePlaceholder'))}" value="${esc(ex.name)}">
       <div class="chips scroll-x">${MUSCLE_GROUP_IDS.map(m => `<button class="chip ${ex.muscle === m ? 'on' : ''}" data-act="exMuscle" data-arg="${m}"><i class="dot" style="background:${muscleColor(m)}"></i>${esc(t('muscle.' + m))}</button>`).join('')}</div>
-      <div class="big-steppers">
-        <div class="bs"><span class="cap">${esc(t('exercise.sets'))}</span><output>${ex.sets}</output>
+      <div class="big-steppers ${strength && !perSet ? 'three' : ''} ${perSet ? 'one' : ''}">
+        <div class="bs"><span class="cap">${esc(setsCaption)}</span><output>${ex.sets}</output>
           <div class="bs-btns"><button data-act="exSets" data-arg="-1" aria-label="${esc(t('common.less'))}">${icon('minus')}</button><button data-act="exSets" data-arg="1" aria-label="${esc(t('common.more'))}">${icon('plus')}</button></div></div>
+        ${perSet ? '' : strength ? `
+        <div class="bs"><span class="cap">${esc(strengthUnit(ex))}</span><output>${ex.reps}</output>
+          <div class="bs-btns"><button data-act="exReps" data-arg="-1" aria-label="${esc(t('common.less'))}">${icon('minus')}</button><button data-act="exReps" data-arg="1" aria-label="${esc(t('common.more'))}">${icon('plus')}</button></div></div>
+        <div class="bs"><span class="cap">${esc(t('strength.weight'))}</span><input class="bs-input" type="text" inputmode="decimal" id="exWeight" data-input="exWeight" value="${esc(String(ex.weight || 0).replace('.', currentLanguage === 'en' ? '.' : ','))}" aria-label="${esc(t('strength.weight'))}">
+          <div class="bs-btns"><button data-act="exWeightStep" data-arg="-2.5" aria-label="${esc(t('common.less'))}">${icon('minus')}</button><button data-act="exWeightStep" data-arg="2.5" aria-label="${esc(t('common.more'))}">${icon('plus')}</button></div></div>`
+        : `
         <div class="bs"><span class="cap">${esc(t('exercise.secondsPerSet'))}</span><output>${ex.seconds}</output>
-          <div class="bs-btns"><button data-act="exSeconds" data-arg="-5" aria-label="${esc(t('common.less'))}">${icon('minus')}</button><button data-act="exSeconds" data-arg="5" aria-label="${esc(t('common.more'))}">${icon('plus')}</button></div></div>
+          <div class="bs-btns"><button data-act="exSeconds" data-arg="-5" aria-label="${esc(t('common.less'))}">${icon('minus')}</button><button data-act="exSeconds" data-arg="5" aria-label="${esc(t('common.more'))}">${icon('plus')}</button></div></div>`}
       </div>
+      ${g.inGroup ? `<div class="muted small">${esc(t('group.roundsHint'))}</div>` : ''}
+      ${strength ? `<div class="seg-row">
+        <div class="seg small"><button class="${perSet ? '' : 'on'}" data-act="exPerSet" data-arg="0">${esc(t('strength.modeSame'))}</button><button class="${perSet ? 'on' : ''}" data-act="exPerSet" data-arg="1">${esc(t('strength.modePerSet'))}</button></div>
+        <div class="seg small"><button class="${ex.unit !== 'seconds' ? 'on' : ''}" data-act="exUnit" data-arg="reps">${esc(t('strength.unitReps'))}</button><button class="${ex.unit === 'seconds' ? 'on' : ''}" data-act="exUnit" data-arg="seconds">${esc(t('strength.unitSeconds'))}</button></div>
+      </div>` : ''}
+      ${perSet ? `<div class="per-set">${ex.setPlan.map((p, k) => `
+        <div class="per-set-row"><span class="per-set-n">${k + 1}</span>
+          <div class="stepper"><button data-act="exPlanReps" data-arg="${k}|-1" aria-label="${esc(t('common.less'))}">${icon('minus', 15)}</button><output>${p.r}</output><button data-act="exPlanReps" data-arg="${k}|1" aria-label="${esc(t('common.more'))}">${icon('plus', 15)}</button></div>
+          <div class="stepper"><button data-act="exPlanWeight" data-arg="${k}|-2.5" aria-label="${esc(t('common.less'))}">${icon('minus', 15)}</button><output>${Number(p.w || 0).toLocaleString(currentLanguage)} kg</output><button data-act="exPlanWeight" data-arg="${k}|2.5" aria-label="${esc(t('common.more'))}">${icon('plus', 15)}</button></div>
+        </div>`).join('')}</div>` : ''}
+      ${lastTime ? `<div class="muted small">${esc(lastTime)}</div>` : ''}
+      ${suggestion ? `<button class="chip small on raise-chip" data-act="exApplySuggestion" data-arg="${suggestion}">${esc(t('strength.raiseTo', {w: fmtKg(suggestion)}))}</button>` : ''}
       <div class="pauses">
-        ${pauseRow(t('ex.setPauseLabel'), ex.setPauseOverride != null ? t('ex.customHint') : t('ex.defaultHint', {s: state.plan.setPauseSeconds}), effectiveSetPause(ex), ex.setPauseOverride != null, 'exSetPause', 'exSetPauseDefault')}
-        ${i < d.exercises.length - 1 ? pauseRow(t('ex.pauseAfterLabel'), ex.pauseAfterOverride != null ? t('ex.customHint') : t('ex.defaultHint', {s: state.plan.pauseSeconds}), effectivePauseAfter(ex), ex.pauseAfterOverride != null, 'exPauseAfter', 'exPauseAfterDefault') : ''}
+        ${pauseRow(setPauseLabel, setPauseHint, effectiveSetPause(ex, d), ex.setPauseOverride != null, 'exSetPause', 'exSetPauseDefault')}
+        ${!strength && g.last && i < d.exercises.length - 1 ? pauseRow(g.inGroup ? t('group.afterLabel') : t('ex.pauseAfterLabel'), ex.pauseAfterOverride != null ? t('ex.customHint') : t('ex.defaultHint', {s: state.plan.pauseSeconds}), effectivePauseAfter(ex, d), ex.pauseAfterOverride != null, 'exPauseAfter', 'exPauseAfterDefault') : ''}
       </div>
+      ${ex.muscle !== 'warmup' && ex.muscle !== 'stretch' ? `<button class="btn btn-ghost" data-act="openLibraryForGroup" data-arg="${ex.id}">${icon('link', 18)} ${esc(g.inGroup ? t('group.add') : t('group.addPartner'))}</button>` : ''}
       <div class="tools">
         <button data-act="exMove" data-arg="-1" ${i === 0 ? 'disabled' : ''}>${icon('up', 18)} ${esc(t('ex.earlier'))}</button>
         <button data-act="exMove" data-arg="1" ${i === d.exercises.length - 1 ? 'disabled' : ''}>${icon('down', 18)} ${esc(t('ex.later'))}</button>
@@ -1481,10 +1714,17 @@ function vSheet(){
       <button class="btn btn-primary" data-act="closeSheet">${esc(t('common.done'))}</button>`);
   }
 
-  if(ui.sheet === 'library'){
+  if(ui.sheet === 'library' && d){
+    const anchor = libraryAnchor(d);
+    const partner = ui.libGroupWith ? d.exercises.find(e => e.id === ui.libGroupWith) : null;
+    const suggestions = suggestMuscles(d, partner || anchor, !!partner);
     return wrap(`
-      <h2 class="display sheet-title">${esc(t('library.title'))}</h2>
-      <label class="search">${icon('search', 18)}<input type="search" id="libSearch" data-input="libQuery" placeholder="${esc(t('library.search'))}" value="${esc(ui.libQuery)}"></label>
+      <h2 class="display sheet-title">${esc(partner ? t('library.titleGroup', {name: partner.name || t('exercise.namePlaceholder')}) : t('library.title'))}</h2>
+      <label class="search">${icon('search', 18)}<input type="search" id="libSearch" data-input="libQuery" placeholder="${esc(t('library.searchOrCreate'))}" value="${esc(ui.libQuery)}"></label>
+      ${!partner && anchor ? `<button class="chip small group-toggle" data-act="libToggleGroup" data-arg="${anchor.id}">${icon('link', 14)} ${esc(t('library.groupWith', {name: anchor.name || t('exercise.namePlaceholder')}))}</button>` : ''}
+      ${partner ? `<button class="chip small on group-toggle" data-act="libToggleGroup" data-arg="">${icon('link', 14)} ${esc(t('library.groupingOn'))}</button>` : ''}
+      ${suggestions.length ? `<div class="suggest"><div class="cap">${esc(t(partner ? 'suggest.titleGroup' : 'suggest.title'))}</div>
+        <div class="suggest-row">${suggestions.map(x => `<button class="sug ${ui.libFilter === x.muscle ? 'on' : ''}" data-act="libFilter" data-arg="${ui.libFilter === x.muscle ? '' : x.muscle}"><b><i class="dot" style="background:${muscleColor(x.muscle)}"></i>${esc(t('muscle.' + x.muscle))}</b><small>${esc(x.reason)}</small></button>`).join('')}</div></div>` : ''}
       <div class="chips scroll-x">${['', ...MUSCLE_GROUP_IDS.filter(m => m !== 'other')].map(m => `<button class="chip small ${ui.libFilter === m ? 'on' : ''}" data-act="libFilter" data-arg="${m}">${esc(m ? t('muscle.' + m) : t('library.all'))}</button>`).join('')}</div>
       <div class="sheet-scroll" id="libList">${vLibraryList()}</div>`);
   }
@@ -1493,11 +1733,24 @@ function vSheet(){
     return wrap(`
       <h2 class="display sheet-title">${esc(t('daySheet.title'))}</h2>
       <label class="field"><span>${esc(t('daySheet.name'))}</span><input type="text" id="dayName" data-input="dayName" value="${esc(d.name)}"></label>
+      <div class="field"><span>${esc(t('daySheet.type'))}</span>
+        <div class="seg small unit-seg"><button class="${dayType(d) === 'interval' ? 'on' : ''}" data-act="setDayType" data-arg="interval">${esc(t('train.typeInterval'))}</button><button class="${dayType(d) === 'strength' ? 'on' : ''}" data-act="setDayType" data-arg="strength">${esc(t('train.typeStrength'))}</button></div>
+        <small>${esc(t(dayType(d) === 'strength' ? 'daySheet.strengthHint' : 'daySheet.intervalHint'))}</small></div>
       ${ui.confirmDeleteDay
         ? `<div class="msg msg-error">${esc(t('day.deleteConfirm', {name: d.name}))}</div>
            <div class="row-btns"><button class="btn btn-ghost" data-act="cancelDeleteDay">${esc(t('common.cancel'))}</button><button class="btn btn-danger" data-act="deleteDay">${esc(t('daySheet.deleteConfirm'))}</button></div>`
         : `<button class="btn btn-ghost danger-text" data-act="askDeleteDay">${icon('trash', 18)} ${esc(t('daySheet.delete'))}</button>`}
       <button class="btn btn-primary" data-act="closeSheet">${esc(t('common.done'))}</button>`);
+  }
+
+  if(ui.sheet === 'stopStrength' && sr){
+    const c = srCounts();
+    return wrap(`
+      <h2 class="display sheet-title">${esc(t('stop.title'))}</h2>
+      <p class="muted">${esc(t('stop.text', {done: c.done, total: c.total}))}</p>
+      <button class="btn btn-primary" data-act="closeSheet">${esc(t('stop.continue'))}</button>
+      <button class="btn btn-ghost" data-act="stopStrength">${esc(t('stop.end'))}</button>
+      <button class="btn btn-ghost danger-text" data-act="discardRunningStrength">${esc(t('strength.discardRunning'))}</button>`);
   }
 
   if(ui.sheet === 'stop' && state.running){
@@ -1528,14 +1781,35 @@ function vSheet(){
   }
   return '';
 }
+// Letzte normale Uebung des Tages: Bezugspunkt fuer die Vorschlaege.
+function libraryAnchor(d){
+  for(let i = d.exercises.length - 1; i >= 0; i--){
+    const m = d.exercises[i].muscle;
+    if(m !== 'warmup' && m !== 'stretch') return d.exercises[i];
+  }
+  return null;
+}
+/* Reihenfolge bewusst: selbst anlegen, dann eigene Uebungen, die Bibliothek nur aufgeklappt oder bei einer Suche. */
 function vLibraryList(){
-  const q = ui.libQuery.trim().toLowerCase();
-  const items = (exerciseLibrary || []).filter(e => (!ui.libFilter || e.muscle === ui.libFilter) && (!q || e.name.toLowerCase().includes(q)));
-  const custom = `<button class="list-row" data-act="addCustomExercise"><span class="lib-plus">${icon('plus', 18)}</span><div class="grow"><b>${esc(q ? t('library.customNamed', {name: ui.libQuery.trim()}) : t('library.custom'))}</b><small>${esc(t('library.customHint'))}</small></div></button>`;
-  if(!exerciseLibrary) return custom + `<div class="muted pad">${esc(t('common.loading'))}</div>`;
-  return custom + items.map(e => `<button class="list-row" data-act="addLibraryExercise" data-arg="${esc(e.id)}"><i class="dot" style="background:${muscleColor(e.muscle)}"></i>
-    <div class="grow"><b>${esc(e.name)}</b><small>${esc(t('muscle.' + e.muscle))} · ${esc(e.equipment.map(x => t('equipment.' + x)).join(', '))}</small></div>${icon('plus', 18)}</button>`).join('')
-    + (items.length ? '' : `<div class="muted pad">${esc(t('library.noMatch'))}</div>`);
+  const raw = ui.libQuery.trim();
+  const q = raw.toLowerCase();
+  const matches = (name, muscle) => (!ui.libFilter || muscle === ui.libFilter) && (!q || name.toLowerCase().includes(q));
+  const mine = (state.plan.myExercises || []).filter(m => matches(m.name, m.muscle)).sort((a, b) => (b.usedAt || 0) - (a.usedAt || 0));
+  const exact = (state.plan.myExercises || []).some(m => myKey(m.name) === q);
+  const create = exact ? '' : `<button class="list-row create-row" data-act="addCustomExercise"><span class="lib-plus">${icon('plus', 18)}</span><div class="grow"><b>${esc(raw ? t('library.customNamed', {name: raw}) : t('library.custom'))}</b><small>${esc(t('library.customHint'))}</small></div></button>`;
+  const mineHtml = mine.length
+    ? mine.map(m => `<div class="my-row"><button class="list-row" data-act="addMyExercise" data-arg="${esc(m.id)}"><i class="dot" style="background:${muscleColor(m.muscle)}"></i>
+        <div class="grow"><b>${esc(m.name)}</b><small>${esc(t('muscle.' + m.muscle))}${m.last ? ' · ' + esc(relDay(new Date(m.last.date))) : ''}</small></div>${icon('plus', 18)}</button>
+        <button class="my-remove" data-act="removeMyExercise" data-arg="${esc(m.id)}" aria-label="${esc(t('library.removeMine', {name: m.name}))}">${icon('close', 15)}</button></div>`).join('')
+    : `<div class="muted pad side">${esc(q || ui.libFilter ? t('library.noMineMatch') : t('library.noMine'))}</div>`;
+  const taken = new Set((state.plan.myExercises || []).map(m => myKey(m.name)));
+  const lib = (exerciseLibrary || []).filter(e => !taken.has(myKey(e.name)) && matches(e.name, e.muscle));
+  const showLib = ui.libMore || !!q;
+  const libHtml = !exerciseLibrary ? '' : `
+    <button class="lib-more" data-act="libToggleMore" aria-expanded="${showLib}">${icon(showLib ? 'up' : 'down', 16)} ${esc(t('library.more', {n: lib.length}))}</button>
+    ${showLib ? lib.map(e => `<button class="list-row" data-act="addLibraryExercise" data-arg="${esc(e.id)}"><i class="dot" style="background:${muscleColor(e.muscle)}"></i>
+      <div class="grow"><b>${esc(e.name)}</b><small>${esc(t('muscle.' + e.muscle))} · ${esc(e.equipment.map(x => t('equipment.' + x)).join(', '))}</small></div>${icon('plus', 18)}</button>`).join('') : ''}`;
+  return `${create}<div class="cap side">${esc(t('library.mine'))}</div>${mineHtml}${libHtml}`;
 }
 
 /* ---------- Aktionen ---------- */
@@ -1544,14 +1818,44 @@ function currentExercise(){
   return d ? d.exercises.find(e => e.id === ui.editExId) : null;
 }
 function openSheet(name){ ui.sheet = name; rerender(); }
-function closeSheet(){ ui.sheet = null; ui.confirmDeleteDay = false; rerender(); }
-function insertExercise(ex){
+function closeSheet(){
+  if(ui.sheet === 'editEx'){ const ex = currentExercise(); if(ex){ rememberExercise(ex); schedulePersist(); } }
+  ui.sheet = null; ui.confirmDeleteDay = false; rerender();
+}
+// Neue Uebung vorbelegen: mit den eigenen letzten Werten, passend zur Trainingsart des Tages.
+function prepareNewExercise(ex, day, my){
+  if(my){ ex.sets = my.sets || ex.sets; ex.seconds = my.seconds || ex.seconds; }
+  if(dayType(day) === 'strength') applyStrengthDefaults(ex, my);
+  return ex;
+}
+function applyStrengthDefaults(ex, my){
+  if(ex.reps == null) ex.reps = my && my.reps != null ? my.reps : (ex.muscle === 'warmup' || ex.muscle === 'stretch' ? ex.seconds : 10);
+  if(ex.weight == null) ex.weight = my && my.weight != null ? my.weight : 0;
+  if(ex.unit == null) ex.unit = my && my.unit ? my.unit : (ex.muscle === 'warmup' || ex.muscle === 'stretch' ? 'seconds' : 'reps');
+  if(ex.setPlan == null && my && my.setPlan) ex.setPlan = my.setPlan.map(p => ({ r: p.r, w: p.w }));
+}
+function insertExercise(ex, my){
   const d = activeDay();
   ex.id = uid();
+  prepareNewExercise(ex, d, my);
   const list = d.exercises;
-  // Neue Uebungen vor das abschliessende Dehnen setzen, falls es eines gibt.
-  const at = list.length && list[list.length - 1].muscle === 'stretch' ? list.length - 1 : list.length;
+  const partner = ui.libGroupWith ? list.find(e => e.id === ui.libGroupWith) : null;
+  let at;
+  if(partner){
+    // Direkt hinter die Gruppe der Partner-Uebung setzen und die Rundenzahl uebernehmen.
+    const g = groupInfo(d, list.indexOf(partner));
+    at = g.block[g.block.length - 1] + 1;
+    if(!partner.groupId) partner.groupId = uid();
+    ex.groupId = partner.groupId;
+    ex.sets = partner.sets;
+  } else {
+    // Neue Uebungen vor das abschliessende Dehnen setzen, falls es eines gibt.
+    at = list.length && list[list.length - 1].muscle === 'stretch' ? list.length - 1 : list.length;
+  }
   list.splice(at, 0, ex);
+  normalizeGroups(d);
+  ui.libGroupWith = null;
+  rememberExercise(ex);
   schedulePersist();
   ui.editExId = ex.id;
   ui.sheet = 'editEx';
@@ -1581,7 +1885,7 @@ const ACTIONS = {
   },
   pickDay(id){ state.activeDayId = id; render(); },
   addDay(){
-    const day = { id: uid(), name: t('main.newDayName'), exercises: [] };
+    const day = { id: uid(), name: t('main.newDayName'), type: 'interval', exercises: [] };
     state.plan.days.push(day);
     state.activeDayId = day.id;
     schedulePersist();
@@ -1603,28 +1907,104 @@ const ACTIONS = {
   },
   closeSheet(){ closeSheet(); },
 
+  setDayType(type){
+    const d = activeDay();
+    d.type = type;
+    if(type === 'strength') d.exercises.forEach(ex => applyStrengthDefaults(ex, findMyExercise(ex.name)));
+    schedulePersist(); rerender();
+  },
+
+  // Gruppen
+  toggleLink(arg){
+    const d = activeDay(), list = d.exercises, i = Number(arg), a = list[i], b = list[i + 1];
+    if(!a || !b) return;
+    if(a.groupId && a.groupId === b.groupId){
+      // Trennen: alles ab b bildet eine eigene Gruppe.
+      const g = a.groupId, fresh = uid();
+      for(let k = i + 1; k < list.length && list[k].groupId === g; k++) list[k].groupId = fresh;
+    } else {
+      const bGroup = b.groupId;
+      const rounds = a.groupId || !bGroup ? a.sets : b.sets;
+      const g = a.groupId || bGroup || uid();
+      a.groupId = g;
+      list.forEach(e => { if(e === b || (bGroup && e.groupId === bGroup)) e.groupId = g; });
+      const changed = list.some(e => e.groupId === g && e.sets !== rounds);
+      list.forEach(e => { if(e.groupId === g) e.sets = rounds; });
+      if(changed) showToast(t('group.synced', {n: rounds}));
+    }
+    normalizeGroups(d);
+    schedulePersist(); rerender();
+  },
+  openLibraryForGroup(exId){
+    ACTIONS.openLibrary();
+    ui.libGroupWith = exId;
+    rerender();
+  },
+  libToggleGroup(exId){ ui.libGroupWith = exId || null; rerender(); },
+  libToggleMore(){ ui.libMore = !ui.libMore; refreshLibraryList(); },
+
   // Uebungen
   editEx(id){ ui.editExId = id; openSheet('editEx'); },
   exMuscle(m){ currentExercise().muscle = m; schedulePersist(); rerender(); },
-  exSets(v){ const ex = currentExercise(); ex.sets = Math.max(1, Math.min(20, ex.sets + Number(v))); schedulePersist(); rerender(); },
+  exSets(v){
+    const d = activeDay(), ex = currentExercise();
+    ex.sets = Math.max(1, Math.min(20, ex.sets + Number(v)));
+    // In einer Gruppe gilt die Rundenzahl fuer alle Uebungen.
+    if(ex.groupId) d.exercises.forEach(e => { if(e.groupId === ex.groupId) e.sets = ex.sets; });
+    schedulePersist(); rerender();
+  },
+  exReps(v){ const ex = currentExercise(); ex.reps = Math.max(1, Math.min(600, (ex.reps || 0) + Number(v) * (ex.unit === 'seconds' ? 5 : 1))); schedulePersist(); rerender(); },
+  exWeightStep(v){ const ex = currentExercise(); ex.weight = Math.max(0, (ex.weight || 0) + Number(v)); schedulePersist(); rerender(); },
+  exUnit(u){ currentExercise().unit = u; schedulePersist(); rerender(); },
+  exPerSet(on){
+    const ex = currentExercise();
+    if(on === '1' && !ex.setPlan) ex.setPlan = Array.from({length: ex.sets}, () => ({ r: ex.reps, w: ex.weight || 0 }));
+    if(on === '0' && ex.setPlan){ ex.reps = ex.setPlan[0].r; ex.weight = ex.setPlan[0].w || 0; delete ex.setPlan; }
+    schedulePersist(); rerender();
+  },
+  exPlanReps(arg){
+    const [k, v] = arg.split('|'), ex = currentExercise(), p = ex.setPlan[Number(k)];
+    p.r = Math.max(1, Math.min(600, p.r + Number(v) * (ex.unit === 'seconds' ? 5 : 1)));
+    schedulePersist(); rerender();
+  },
+  exPlanWeight(arg){
+    const [k, v] = arg.split('|'), p = currentExercise().setPlan[Number(k)];
+    p.w = Math.max(0, (p.w || 0) + Number(v));
+    schedulePersist(); rerender();
+  },
+  exApplySuggestion(w){ currentExercise().weight = Number(w); schedulePersist(); rerender(); },
   exSeconds(v){ const ex = currentExercise(); ex.seconds = Math.max(5, Math.min(3600, ex.seconds + Number(v))); schedulePersist(); rerender(); },
-  exSetPause(v){ const ex = currentExercise(); ex.setPauseOverride = clampSeconds(effectiveSetPause(ex) + Number(v)); schedulePersist(); rerender(); },
+  exSetPause(v){ const ex = currentExercise(); ex.setPauseOverride = clampSeconds(effectiveSetPause(ex, activeDay()) + Number(v)); schedulePersist(); rerender(); },
   exSetPauseDefault(){ currentExercise().setPauseOverride = null; schedulePersist(); rerender(); },
-  exPauseAfter(v){ const ex = currentExercise(); ex.pauseAfterOverride = clampSeconds(effectivePauseAfter(ex) + Number(v)); schedulePersist(); rerender(); },
+  exPauseAfter(v){ const ex = currentExercise(); ex.pauseAfterOverride = clampSeconds(effectivePauseAfter(ex, activeDay()) + Number(v)); schedulePersist(); rerender(); },
   exPauseAfterDefault(){ currentExercise().pauseAfterOverride = null; schedulePersist(); rerender(); },
   exMove(dir){
-    const list = activeDay().exercises, i = list.findIndex(e => e.id === ui.editExId), j = i + Number(dir);
+    const d = activeDay(), list = d.exercises, i = list.findIndex(e => e.id === ui.editExId), step = Number(dir), j = i + step;
     if(j < 0 || j >= list.length) return;
-    [list[i], list[j]] = [list[j], list[i]];
+    const ex = list[i], other = list[j];
+    if(ex.groupId && other.groupId !== ex.groupId){
+      // Am Rand der Gruppe: Die Uebung verlaesst die Gruppe und bleibt direkt daneben stehen.
+      ex.groupId = null;
+    } else if(!ex.groupId && other.groupId){
+      // Einzelne Uebung springt ueber die ganze Gruppe.
+      const block = groupInfo(d, j).block;
+      list.splice(i, 1);
+      list.splice(step > 0 ? block[block.length - 1] : block[0], 0, ex);
+    } else {
+      [list[i], list[j]] = [list[j], list[i]];
+    }
+    normalizeGroups(d);
     schedulePersist(); rerender();
   },
   exRemove(){
-    const list = activeDay().exercises;
+    const d = activeDay(), list = d.exercises;
     list.splice(list.findIndex(e => e.id === ui.editExId), 1);
+    normalizeGroups(d);
+    ui.sheet = null;
     schedulePersist(); closeSheet();
   },
   openLibrary(){
-    ui.libQuery = ''; ui.libFilter = '';
+    ui.libQuery = ''; ui.libFilter = ''; ui.libGroupWith = null; ui.libMore = false;
     if(!exerciseLibrary) loadExerciseLibrary().then(() => { if(ui.sheet === 'library') refreshLibraryList(); }).catch(() => {});
     openSheet('library');
   },
@@ -1632,6 +2012,15 @@ const ACTIONS = {
   addLibraryExercise(id){
     const entry = (exerciseLibrary || []).find(e => e.id === id);
     if(entry) insertExercise(makeExercise(entry.name, entry.muscle, 3, 30));
+  },
+  addMyExercise(id){
+    const my = (state.plan.myExercises || []).find(m => m.id === id);
+    if(my) insertExercise(makeExercise(my.name, my.muscle, my.sets || 3, my.seconds || 30), my);
+  },
+  removeMyExercise(id){
+    state.plan.myExercises = (state.plan.myExercises || []).filter(m => m.id !== id);
+    schedulePersist();
+    refreshLibraryList();
   },
   addCustomExercise(){
     insertExercise(makeExercise(ui.libQuery.trim(), ui.libFilter || 'other', 3, 30));
@@ -1641,7 +2030,15 @@ const ACTIONS = {
 
   // Training
   enableSound(){ setTimeout(() => { beep(880, 140, 0.5); updateSoundHint(); }, 150); },
-  start(){ const d = activeDay(); if(d && d.exercises.length) startTimer(d); },
+  start(){
+    const d = activeDay();
+    if(!d || !d.exercises.length) return;
+    if(dayType(d) === 'strength'){
+      d.exercises.forEach(ex => applyStrengthDefaults(ex, findMyExercise(ex.name)));
+      srClearSaved();
+      startStrength(d);
+    } else startTimer(d);
+  },
   wheelBack(){ wheel.follow = true; clearTimeout(wheel.idle); centerWheel(true); updateFollowPill(); },
   togglePause(){ togglePause(); },
   skipStep(){ skipStep(); },
@@ -1669,6 +2066,8 @@ const ACTIONS = {
   // Profil
   globalSetPause(v){ state.plan.setPauseSeconds = clampSeconds(state.plan.setPauseSeconds + Number(v)); schedulePersist(); rerender(); },
   globalPause(v){ state.plan.pauseSeconds = clampSeconds(state.plan.pauseSeconds + Number(v)); schedulePersist(); rerender(); },
+  globalGroupSwitch(v){ state.plan.groupSwitchSeconds = clampSeconds(state.plan.groupSwitchSeconds + Number(v)); schedulePersist(); rerender(); },
+  globalStrengthRest(v){ state.plan.strengthRestSeconds = clampSeconds(state.plan.strengthRestSeconds + Number(v)); schedulePersist(); rerender(); },
   toggleSound(){ state.plan.soundOn = !state.plan.soundOn; schedulePersist(); rerender(); },
   setTheme(theme){ applyTheme(theme); settings.theme = theme === 'system' ? null : theme; scheduleSettingsPersist(); rerender(); },
   togglePw(){ ui.pwOpen = !ui.pwOpen; rerender(); },
@@ -1685,6 +2084,7 @@ const INPUTS = {
   curPw(v){ drafts.curPw = v; }, newPw(v){ drafts.newPw = v; }, deletePw(v){ drafts.deletePw = v; },
   exName(v){ const ex = currentExercise(); if(ex){ ex.name = v; schedulePersist(); } },
   dayName(v){ const d = activeDay(); if(d){ d.name = v; schedulePersist(); } },
+  exWeight(v){ const ex = currentExercise(); if(ex){ const n = parseFloat(String(v).replace(',', '.')); ex.weight = isNaN(n) || n < 0 ? 0 : n; schedulePersist(); } },
   libQuery(v){ ui.libQuery = v; refreshLibraryList(); },
   constraints(v){ onboarding.constraints = v; scheduleOnboardingPersist(); }
 };
@@ -1869,6 +2269,7 @@ async function logSession(summary){
     completionFraction: summary.completionFraction,
     completed: summary.completed
   };
+  if(summary.type === 'strength'){ doc.type = 'strength'; doc.volumeKg = summary.volumeKg; }
   // Sofort lokal eintragen, damit "Dran" und Statistik ohne Neuladen stimmen.
   if(historySessions) historySessions.unshift(Object.assign({}, doc, { finishedAt: new Date() }));
   try{
@@ -1889,6 +2290,367 @@ function endRun(summary){
 }
 function stopTimer(){ endRun(computeSessionSummary(false)); }
 function finishTimer(){ finishFanfare(); endRun(computeSessionSummary(true)); }
+
+/* ---------- Krafttraining ----------
+   Nicht zeitgetrieben: Die Trainingszeit und die Pause seit dem letzten Satz laufen nur als Info mit.
+   Man hakt jeden Satz ab und sieht dadurch, was als Naechstes kommt. Der Stand liegt zusaetzlich im
+   localStorage, weil ein Krafttraining lange dauert und der Browser die Seite zwischendurch verwerfen kann. */
+let sr = null; // laufendes Krafttraining: { dayId, startedAt, sets:{key:{r,w,done,skipped}}, lastCheckAt, restGoal, restBeeped, undo:[], focus }
+let srTicker = null;
+const SR_MAX_AGE_MS = 12 * 60 * 60 * 1000;
+
+function srStorageKey(){ return authUser ? `intervalinator-strength-${authUser.uid}` : null; }
+function srSave(){
+  const key = srStorageKey();
+  if(key && sr){ try{ localStorage.setItem(key, JSON.stringify(sr)); }catch(e){} }
+}
+function srClearSaved(){
+  const key = srStorageKey();
+  if(key){ try{ localStorage.removeItem(key); }catch(e){} }
+}
+// Ein unterbrochenes Training (Seite neu geladen, App beendet), das noch fortgesetzt werden kann.
+function srSaved(){
+  const key = srStorageKey();
+  if(!key) return null;
+  try{
+    const saved = JSON.parse(localStorage.getItem(key));
+    if(!saved || Date.now() - saved.startedAt > SR_MAX_AGE_MS) return null;
+    const day = state.plan.days.find(d => d.id === saved.dayId);
+    return day ? { saved, day } : null;
+  }catch(e){ return null; }
+}
+const srKey = (ex, set) => `${ex.id}:${set}`;
+function strengthQueue(day){
+  const out = [];
+  let letterIdx = 0;
+  blocksOf(day).forEach(block => {
+    const grouped = block.length > 1;
+    const letter = grouped ? String.fromCharCode(65 + letterIdx++) : '';
+    const rounds = Math.max(1, day.exercises[block[0]].sets || 1);
+    for(let set = 1; set <= rounds; set++){
+      block.forEach((exIdx, m) => out.push({ ex: day.exercises[exIdx], exIdx, set, rounds, grouped, tag: grouped ? letter + (m + 1) : '' }));
+    }
+  });
+  return out;
+}
+function srEntry(item){ return sr.sets[srKey(item.ex, item.set)]; }
+function srOpen(item){ const e = srEntry(item); return !e.done && !e.skipped; }
+function srCurrent(){
+  const q = strengthQueue(runDay);
+  if(sr.focus){
+    const f = q.find(x => x.ex.id === sr.focus && srOpen(x));
+    if(f) return f;
+    sr.focus = null;
+  }
+  return q.find(srOpen) || null;
+}
+function srNextAfter(cur){
+  if(!cur) return null;
+  return strengthQueue(runDay).find(x => srOpen(x) && !(x.ex.id === cur.ex.id && x.set === cur.set)) || null;
+}
+function srCounts(){
+  const q = strengthQueue(runDay);
+  return { done: q.filter(x => srEntry(x).done).length, closed: q.filter(x => !srOpen(x)).length, total: q.length };
+}
+// Zielwerte eines Satzes: entweder fuer alle Saetze gleich oder einzeln festgelegt (ex.setPlan).
+function strengthTarget(ex, set){
+  const plan = ex.setPlan;
+  if(plan && plan.length){ const p = plan[set - 1] || plan[plan.length - 1]; return { r: p.r, w: p.w || 0 }; }
+  return { r: ex.reps, w: ex.weight || 0 };
+}
+function syncSetPlan(ex){
+  if(!ex.setPlan) return;
+  while(ex.setPlan.length < ex.sets) ex.setPlan.push(Object.assign({}, ex.setPlan[ex.setPlan.length - 1]));
+  ex.setPlan.length = ex.sets;
+}
+function strengthUnit(ex){ return ex.unit === 'seconds' ? t('strength.unitSeconds') : t('strength.unitReps'); }
+function fmtKg(w){ return `${Number(w).toLocaleString(currentLanguage)} kg`; }
+function setLabel(r, w, ex){
+  const amount = ex.unit === 'seconds' ? `${r} s` : `${r}`;
+  return w > 0 ? `${amount} × ${fmtKg(w)}` : amount + (ex.unit === 'seconds' ? '' : ` ${t('strength.unitReps')}`);
+}
+// Steigerung: Wurden zuletzt alle Saetze mit der Zielzahl geschafft, die Last leicht erhoehen (rund 2-10 %).
+function strengthSuggestion(ex){
+  if(ex.unit === 'seconds' || ex.setPlan) return null;
+  const my = findMyExercise(ex.name);
+  const last = my && my.last;
+  if(!last || !last.sets || !last.sets.length) return null;
+  const maxW = Math.max(...last.sets.map(s => s.w || 0));
+  if(maxW <= 0 || last.sets.length < ex.sets || !last.sets.every(s => s.r >= ex.reps)) return null;
+  const next = maxW + (maxW < 20 ? 1 : 2.5);
+  return next > (ex.weight || 0) ? next : null;
+}
+function lastTimeLabel(ex){
+  const my = findMyExercise(ex.name);
+  const last = my && my.last;
+  if(!last || !last.sets || !last.sets.length) return '';
+  return t('strength.lastTime', {sets: last.sets.map(s => setLabel(s.r, s.w, ex)).join(' · '), when: relDay(new Date(last.date))});
+}
+
+function startStrength(day, saved){
+  ensureAudio();
+  tryResumeAudio();
+  runDay = day;
+  if(saved){
+    sr = saved;
+    // Falls der Plan inzwischen geaendert wurde: fehlende Saetze ergaenzen.
+    strengthQueue(day).forEach(x => { const k = srKey(x.ex, x.set); if(!sr.sets[k]) sr.sets[k] = Object.assign(strengthTarget(x.ex, x.set), { done: false, skipped: false }); });
+  } else {
+    sr = { dayId: day.id, dayName: day.name, startedAt: Date.now(), sets: {}, lastCheckAt: null, restGoal: 0, restBeeped: true, undo: [], focus: null };
+    strengthQueue(day).forEach(x => { sr.sets[srKey(x.ex, x.set)] = Object.assign(strengthTarget(x.ex, x.set), { done: false, skipped: false }); });
+    srSave();
+  }
+  state.screen = 'strength';
+  ui.sheet = null;
+  requestWakeLock();
+  clearInterval(srTicker);
+  srTicker = setInterval(updateStrengthDOM, 500);
+  render();
+}
+function vStrengthShell(){
+  return `
+  <div class="run strength-run" id="run">
+    <header class="head" data-slot="head"></header>
+    <section class="str-card" data-slot="top" aria-live="polite"></section>
+    <div class="wheel-wrap"><div class="wheel" id="runWheel"></div></div>
+    <button class="follow-pill" id="followPill" data-act="wheelBack" hidden>${icon('up', 16)} ${esc(t('wheel.back'))}</button>
+    <div class="controls" data-slot="ctl"></div>
+  </div>
+  <div id="sheetSlot"></div>`;
+}
+function vStrengthTop(){
+  const cur = srCurrent();
+  const times = `
+    <div class="str-times" id="srRestBox">
+      <div class="str-since"><span class="lab">${esc(t('strength.sinceLast'))}</span><span class="str-clock" id="srRest"></span><span class="str-reco" id="srReco"></span></div>
+      <div class="str-total"><span class="lab">${esc(t('strength.time'))}</span><span class="num" id="srElapsed"></span></div>
+    </div>`;
+  if(!cur) return times + `
+    <div class="str-now"><div class="lab ok">${esc(t('strength.allDoneLabel'))}</div><div class="str-name">${esc(t('strength.allDone'))}</div></div>
+    <button class="set-done" data-act="finishStrength">${icon('flag', 28)} ${esc(t('strength.finish'))}</button>`;
+  const entry = srEntry(cur), ex = cur.ex;
+  const next = srNextAfter(cur);
+  const stepOf = cur.grouped ? t('wheel.roundOf', {set: cur.set, total: cur.rounds}) : t('timer.setOf', {set: cur.set, total: cur.rounds});
+  const nextText = next ? `${next.ex.name || t('exercise.namePlaceholder')} · ${next.grouped ? t('wheel.roundOf', {set: next.set, total: next.rounds}) : t('timer.setOf', {set: next.set, total: next.rounds})}` : t('strength.lastSet');
+  return times + `
+    <div class="str-now">
+      <div class="lab">${esc(stepOf)}${cur.tag ? ' · ' + cur.tag : ''}</div>
+      <div class="str-line"><span class="str-name">${esc(ex.name || t('exercise.namePlaceholder'))}</span><span class="str-target">${esc(setLabel(entry.r, entry.w, ex))}</span></div>
+    </div>
+    <button class="set-done" data-act="srCheck">${icon('check', 32)} ${esc(t('strength.done'))}</button>
+    <div class="str-next"><b>${esc(t('wheel.next'))}:</b> ${esc(nextText)}</div>`;
+}
+function vStrengthCards(){
+  const cur = srCurrent(), next = srNextAfter(cur);
+  const queue = strengthQueue(runDay);
+  return runDay.exercises.map((ex, i) => {
+    const items = queue.filter(x => x.exIdx === i);
+    const isCur = cur && cur.exIdx === i;
+    const allClosed = items.every(x => !srOpen(x));
+    const st = isCur ? 'cur' : allClosed ? 'done' : '';
+    const label = isCur ? t('strength.now') : allClosed ? t('wheel.done') : next && next.exIdx === i ? t('wheel.next') : t('wheel.later');
+    const g = groupInfo(runDay, i);
+    const tag = g.inGroup ? `${g.letter}${g.pos} · ` : '';
+    const rows = items.map(x => {
+      const e = srEntry(x);
+      const active = isCur && x.set === cur.set;
+      return `<button class="set-row ${e.done ? 'done' : ''} ${e.skipped ? 'skipped' : ''} ${active ? 'active' : ''}" data-act="srToggleSet" data-arg="${srKey(x.ex, x.set)}" aria-pressed="${e.done}">
+        <span class="set-check">${e.done ? icon('check', 14) : x.set}</span><span class="grow">${esc(setLabel(e.r, e.w, ex))}</span>${e.skipped ? `<small>${esc(t('strength.skipped'))}</small>` : ''}</button>`;
+    }).join('');
+    const pause = effectiveSetPause(ex, runDay);
+    return `<article class="wcard ${st} ${g.inGroup ? 'grp' : ''}" data-ex="${i}" ${isCur ? '' : `data-act="srFocus" data-arg="${ex.id}"`}>
+      <div class="wtop"><span class="wlabel">${esc(tag + label)}</span><span class="wnum">${i + 1}/${runDay.exercises.length}</span></div>
+      <div class="wname">${st === 'done' ? icon('check', 16) : ''}${esc(ex.name || t('exercise.namePlaceholder'))}</div>
+      <div class="wsub"><i style="background:${muscleColor(ex.muscle)}"></i>${esc(t('muscle.' + ex.muscle))} · ${esc(pause > 0 ? t('strength.reco', {time: formatClock(pause)}) : t('group.direct'))}</div>
+      <div class="set-rows">${rows}</div>
+    </article>`;
+  }).join('');
+}
+function renderStrength(app){
+  let run = document.getElementById('run');
+  const fresh = !run || !run.classList.contains('strength-run');
+  if(fresh){
+    app.innerHTML = vStrengthShell();
+    run = document.getElementById('run');
+    mountWheel();
+  }
+  const counts = srCounts();
+  run.querySelector('[data-slot=head]').innerHTML = `
+    <button class="icon-btn" data-act="askStopStrength" aria-label="${esc(t('timer.cancelBtn'))}">${icon('close')}</button>
+    <h1 class="display center small">${esc(runDay.name)}</h1>
+    <span class="step-count">${counts.closed}/${counts.total}</span>`;
+  run.querySelector('[data-slot=top]').innerHTML = vStrengthTop();
+  const cur = srCurrent();
+  run.querySelector('[data-slot=ctl]').innerHTML = `
+    <button data-act="srUndo" ${sr.undo.length ? '' : 'disabled'}>${icon('prev', 18)} ${esc(t('strength.undoShort'))}</button>
+    <button data-act="srSkip" ${cur ? '' : 'disabled'}>${esc(t('strength.skipShort'))} ${icon('skip', 18)}</button>`;
+  const w = document.getElementById('runWheel');
+  const keep = w.scrollTop;
+  w.innerHTML = vStrengthCards();
+  w.scrollTop = keep;
+  if(fresh || wheel.follow){ wheel.lastSet = w.scrollTop; centerWheel(!fresh); }
+  wheelDepth();
+  updateFollowPill();
+  document.getElementById('sheetSlot').innerHTML = vSheet();
+  updateStrengthDOM();
+}
+function updateStrengthDOM(){
+  if(!sr || state.screen !== 'strength') return;
+  const el = document.getElementById('srElapsed');
+  if(!el) return;
+  el.textContent = formatClock((Date.now() - sr.startedAt) / 1000);
+  const box = document.getElementById('srRestBox');
+  const val = document.getElementById('srRest');
+  const reco = document.getElementById('srReco');
+  if(!sr.lastCheckAt){
+    box.classList.remove('ready');
+    val.textContent = '–';
+    reco.textContent = '';
+    return;
+  }
+  const rest = (Date.now() - sr.lastCheckAt) / 1000;
+  val.textContent = formatClock(rest);
+  const reached = sr.restGoal > 0 && rest >= sr.restGoal;
+  box.classList.toggle('ready', reached);
+  // Die Pause ist nur eine Empfehlung: Es laeuft einfach weiter, beim Erreichen kommt ein leiser Hinweis.
+  reco.textContent = sr.restGoal <= 0 ? t('strength.recoDirect')
+    : t(reached ? 'strength.recoReached' : 'strength.reco', {time: formatClock(sr.restGoal)});
+  if(reached && !sr.restBeeped){
+    sr.restBeeped = true;
+    beep(880, 180, 0.25);
+    if(navigator.vibrate) navigator.vibrate(100);
+  }
+}
+function srAfterChange(){ srSave(); wheel.follow = true; render(); }
+function srCloseSet(item, field){
+  const e = srEntry(item);
+  e[field] = true;
+  e.prev = { at: sr.lastCheckAt, goal: sr.restGoal }; // fuer Zurueck: die Zeit laeuft dann vom Satz davor weiter
+  sr.undo.push(srKey(item.ex, item.set));
+  sr.lastCheckAt = Date.now();
+  sr.restGoal = field === 'done' ? effectiveSetPause(item.ex, runDay) : 0;
+  sr.restBeeped = sr.restGoal <= 0;
+  if(item.grouped) sr.focus = null;
+}
+function strengthSummary(){
+  const queue = strengthQueue(runDay);
+  const byEx = runDay.exercises.map((ex, i) => {
+    const items = queue.filter(x => x.exIdx === i);
+    const logs = items.filter(x => srEntry(x).done).map(x => ({ r: srEntry(x).r, w: srEntry(x).w || 0 }));
+    const volume = ex.unit === 'seconds' ? 0 : logs.reduce((a, l) => a + l.r * l.w, 0);
+    return { name: ex.name || t('exercise.unnamed'), muscle: ex.muscle, reachedSets: logs.length, totalSets: items.length, logs, volume };
+  });
+  const counts = srCounts();
+  const fraction = counts.total ? counts.done / counts.total : 0;
+  const elapsed = Math.round((Date.now() - sr.startedAt) / 1000);
+  return {
+    type: 'strength', dayName: runDay.name,
+    exercises: byEx.filter(e => e.reachedSets > 0), allExercises: byEx,
+    totalPlannedSeconds: elapsed, elapsedSeconds: elapsed, completionFraction: fraction, completed: fraction >= 0.75,
+    volumeKg: byEx.reduce((a, e) => a + e.volume, 0)
+  };
+}
+// Ergebnisse merken: "Letztes Mal" und die Last fuers naechste Training.
+function rememberStrengthResults(summary){
+  runDay.exercises.forEach((ex, i) => {
+    const res = summary.allExercises[i];
+    if(!res || !res.logs.length) return;
+    const my = rememberExercise(ex);
+    if(my) my.last = { date: Date.now(), sets: res.logs };
+  });
+  schedulePersist();
+}
+function endStrength(){
+  const summary = strengthSummary();
+  sessionStartStamp = new Date(sr.startedAt);
+  clearInterval(srTicker);
+  srClearSaved();
+  releaseWakeLock();
+  const anyDone = summary.exercises.length > 0;
+  if(anyDone){
+    // Vor dem Merken vergleichen, damit "mehr als letztes Mal" gegen den alten Stand rechnet.
+    summary.allExercises.forEach((e, i) => {
+      const my = findMyExercise(runDay.exercises[i].name);
+      const prev = my && my.last ? Math.max(0, ...my.last.sets.map(s => s.w || 0)) : 0;
+      const best = Math.max(0, ...e.logs.map(l => l.w));
+      e.raised = prev > 0 && best > prev ? best - prev : 0;
+    });
+    rememberStrengthResults(summary);
+    logSession(summary);
+  }
+  const day = runDay;
+  sr = null;
+  ui.sheet = null;
+  if(anyDone){
+    if(summary.completed) finishFanfare();
+    ui.finished = { summary: Object.assign({}, summary, { exercises: summary.allExercises }), day, strength: true };
+    state.screen = 'finished';
+  } else {
+    state.screen = 'main';
+  }
+  render();
+}
+function vFinishedStrength(){
+  const { summary, day } = ui.finished;
+  const next = dueDay();
+  const done = summary.exercises.reduce((a, e) => a + e.reachedSets, 0);
+  const total = summary.exercises.reduce((a, e) => a + e.totalSets, 0);
+  return `
+  <header class="head"><span class="icon-spacer"></span><span class="grow"></span><button class="icon-btn" data-act="closeFinished" aria-label="${esc(t('finished.back'))}">${icon('close')}</button></header>
+  <div class="screen">
+    <div class="done-hero">
+      <div class="eyebrow ${summary.completed ? 'ok' : ''}">${esc(summary.completed ? t('finished.complete') : t('finished.partial'))}</div>
+      <h1 class="display big">${esc(summary.completed ? t('finished.title2', {day: summary.dayName}) : t('finished.stopped'))}</h1>
+      <p>${esc(t('finished.stats', {time: formatClock(summary.elapsedSeconds), done, total}))}${next ? ' · ' + esc(t('finished.next', {name: next.name})) : ''}</p>
+    </div>
+    <section class="kpis">
+      <div class="kpi"><b>${Math.round(summary.volumeKg).toLocaleString(currentLanguage)} kg</b><span>${esc(t('strength.volume'))}</span></div>
+      <div class="kpi"><b>${done}/${total}</b><span>${esc(t('train.sets'))}</span></div>
+    </section>
+    <ul class="list result-list">${summary.exercises.map((e, i) => ({ e, ex: day.exercises[i] })).filter(x => x.e.reachedSets > 0).map(({ e, ex }) => `
+      <li class="list-row"><div class="grow"><b>${esc(e.name)}</b><small>${esc(e.logs.map(l => setLabel(l.r, l.w, ex)).join(' · '))}</small></div>
+      ${e.raised ? `<span class="raise">${esc(t('strength.raised', {w: fmtKg(e.raised)}))}</span>` : ''}</li>`).join('')}</ul>
+  </div>
+  <div class="startbar"><button class="btn btn-ghost" data-act="closeFinished">${esc(t('finished.back'))}</button></div>`;
+}
+
+Object.assign(ACTIONS, {
+  resumeStrength(){ const s = srSaved(); if(s) startStrength(s.day, s.saved); },
+  discardStrength(){ srClearSaved(); render(); },
+  srCheck(){ const cur = srCurrent(); if(!cur) return; srCloseSet(cur, 'done'); beep(660, 90, 0.3); srAfterChange(); },
+  srSkip(){ const cur = srCurrent(); if(!cur) return; srCloseSet(cur, 'skipped'); srAfterChange(); },
+  srUndo(){
+    const key = sr.undo.pop();
+    if(!key) return;
+    sr.sets[key].done = false; sr.sets[key].skipped = false;
+    const prev = sr.sets[key].prev || { at: null, goal: 0 };
+    sr.lastCheckAt = prev.at; sr.restGoal = prev.goal; sr.restBeeped = true;
+    srAfterChange();
+  },
+  // Satz in der Liste antippen: abhaken oder wieder oeffnen, auch ausserhalb der Reihenfolge.
+  srToggleSet(key){
+    const e = sr.sets[key];
+    if(!e) return;
+    if(e.done || e.skipped){
+      e.done = false; e.skipped = false;
+      sr.undo = sr.undo.filter(k => k !== key);
+    } else {
+      const item = strengthQueue(runDay).find(x => srKey(x.ex, x.set) === key);
+      if(item) srCloseSet(item, 'done');
+    }
+    srAfterChange();
+  },
+  // Andere Uebung vorziehen, z.B. wenn das Geraet gerade belegt ist.
+  srFocus(exId){ sr.focus = exId; srAfterChange(); },
+  askStopStrength(){ ui.sheet = 'stopStrength'; render(); },
+  finishStrength(){ endStrength(); },
+  stopStrength(){ endStrength(); },
+  discardRunningStrength(){
+    clearInterval(srTicker); srClearSaved(); releaseWakeLock();
+    sr = null; ui.sheet = null; state.screen = 'main';
+    render();
+  }
+});
 
 /* ---------- Start ---------- */
 (async function bootstrap(){
@@ -1911,6 +2673,7 @@ function finishTimer(){ finishFanfare(); endRun(computeSessionSummary(true)); }
       state.screen = 'main';
       state.activeDayId = null;
       ui.tab = 'train'; ui.sheet = null; ui.finished = null;
+      clearInterval(srTicker); sr = null;
       settings = { theme: null, language: null };
       onboarding = { equipment: [], focus: [], constraints: '', daysPerWeek: null, sessionMinutes: null, completed: false };
       onboardingCardDismissed = false;

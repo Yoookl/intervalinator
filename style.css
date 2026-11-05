@@ -356,6 +356,18 @@ button.list-row:hover{background:var(--raised)}
 .my-remove{flex:none;width:44px;border:0;background:none;color:var(--ink-3);display:grid;place-items:center}
 .lib-more{display:flex;align-items:center;gap:6px;width:100%;border:0;background:none;padding:14px 18px;font-weight:600;font-size:13.5px;color:var(--ink-2);text-align:left}
 
+/* ---------- Plan exportieren ---------- */
+.export-text{width:100%;border:1.5px solid var(--line);border-radius:12px;background:var(--raised);color:var(--ink-2);padding:10px 12px;font:400 12.5px/1.45 ui-monospace,'Cascadia Mono',Menlo,monospace;resize:vertical}
+
+.file-btn{position:relative;overflow:hidden;cursor:pointer}
+.file-btn input{position:absolute;inset:0;opacity:0;cursor:pointer}
+.file-btn:focus-within{outline:3px solid color-mix(in srgb, var(--accent) 50%, transparent);outline-offset:2px}
+.import-result{display:flex;flex-direction:column;gap:8px}
+.import-result:empty{display:none}
+.import-result .msg{margin:0}
+.sheet .row-btns .btn{min-width:90px}
+textarea.export-text:not([readonly]){background:var(--surface);color:var(--ink)}
+
 /* ---------- Nach dem Training ---------- */
 .done-hero{padding:4px 0 18px}
 .done-hero h1.big{font-size:50px;line-height:.95}

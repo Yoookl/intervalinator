@@ -1013,6 +1013,11 @@ const ui = {
   libQuery: '',
   libGroupWith: null,  // Uebung, mit der eine neue Uebung gruppiert werden soll
   libMore: false,      // Bibliothek aufgeklappt
+  exportDayId: null,   // null = ganzer Plan, sonst ein einzelner Trainingstag
+  exportInfo: '',
+  importResult: null,  // Ergebnis von parsePlanJson
+  importEmptyDayId: null, // leerer Tag, aus dem heraus importiert wird
+  importConfirmReplace: false,
   confirmDeleteDay: false,
   setupOpen: 0,
   finished: null,      // { summary, day } nach einem Training
@@ -1153,6 +1158,7 @@ function vTrain(){
         <p>${esc(t('train.emptyText'))}</p>
         <button class="btn btn-primary" data-act="openSetup">${esc(t('train.emptyGenerate'))}</button>
         <button class="btn btn-ghost" data-act="addDay">${esc(t('train.emptyManual'))}</button>
+        <button class="btn btn-ghost" data-act="openImport">${esc(t('import.title'))}</button>
       </div>
     </div>`;
   }
@@ -1309,6 +1315,8 @@ function vProfile(){
       <li class="list-row"><div class="grow"><b>${esc(t('profile.strengthRest'))}</b><small>${esc(t('profile.strengthRestHint'))}</small></div>${vStepper('globalStrengthRest', state.plan.strengthRestSeconds, ' s')}</li>
       <li class="list-row"><div class="grow"><b>${esc(t('main.soundLabel'))}</b><small>${esc(t('profile.soundHint'))}</small></div>
         <button class="switch ${state.plan.soundOn ? 'on' : ''}" role="switch" aria-checked="${!!state.plan.soundOn}" data-act="toggleSound" aria-label="${esc(t('main.soundLabel'))}"></button></li>
+      <li><button class="list-row" data-act="openExport"><div class="grow"><b>${esc(t('export.title'))}</b><small>${esc(t('export.hint'))}</small></div>${icon('next', 18)}</button></li>
+      <li><button class="list-row" data-act="openImport"><div class="grow"><b>${esc(t('import.title'))}</b><small>${esc(t('import.hint'))}</small></div>${icon('next', 18)}</button></li>
       <li><button class="list-row" data-act="openSetup"><div class="grow"><b>${esc(t('onboarding.editLink'))}</b><small>${esc(t('profile.setupHint'))}</small></div>${icon('next', 18)}</button></li>
     </ul>
     <div class="cap">${esc(t('profile.appearance'))}</div>
@@ -1736,6 +1744,9 @@ function vSheet(){
       <div class="field"><span>${esc(t('daySheet.type'))}</span>
         <div class="seg small unit-seg"><button class="${dayType(d) === 'interval' ? 'on' : ''}" data-act="setDayType" data-arg="interval">${esc(t('train.typeInterval'))}</button><button class="${dayType(d) === 'strength' ? 'on' : ''}" data-act="setDayType" data-arg="strength">${esc(t('train.typeStrength'))}</button></div>
         <small>${esc(t(dayType(d) === 'strength' ? 'daySheet.strengthHint' : 'daySheet.intervalHint'))}</small></div>
+      ${d.exercises.length
+        ? `<button class="btn btn-ghost" data-act="openExport" data-arg="${d.id}">${esc(t('export.dayButton'))}</button>`
+        : `<button class="btn btn-ghost" data-act="openImport" data-arg="${d.id}">${esc(t('import.title'))}</button>`}
       ${ui.confirmDeleteDay
         ? `<div class="msg msg-error">${esc(t('day.deleteConfirm', {name: d.name}))}</div>
            <div class="row-btns"><button class="btn btn-ghost" data-act="cancelDeleteDay">${esc(t('common.cancel'))}</button><button class="btn btn-danger" data-act="deleteDay">${esc(t('daySheet.deleteConfirm'))}</button></div>`
@@ -1761,6 +1772,35 @@ function vSheet(){
       <p class="muted">${esc(t('stop.text', {done: doneSets, total: allSets}))}</p>
       <button class="btn btn-primary" data-act="resumeFromStop">${esc(t('stop.continue'))}</button>
       <button class="btn btn-ghost" data-act="stopTraining">${esc(t('stop.end'))}</button>`, 'resumeFromStop');
+  }
+
+  if(ui.sheet === 'export'){
+    const day = ui.exportDayId ? state.plan.days.find(x => x.id === ui.exportDayId) : null;
+    return wrap(`
+      <h2 class="display sheet-title">${esc(day ? t('export.titleDay', {name: day.name}) : t('export.title'))}</h2>
+      <button class="btn btn-primary" data-act="exportClaude">${icon('spark', 20)} ${esc(t('export.claude'))}</button>
+      ${ui.exportInfo ? `<div class="msg msg-info" role="status">${esc(ui.exportInfo)}</div>` : ''}
+      <div class="row-btns">
+        <button class="btn btn-ghost" data-act="exportCopy">${esc(t('export.copy'))}</button>
+        ${navigator.share ? `<button class="btn btn-ghost" data-act="exportShare">${esc(t('export.share'))}</button>` : ''}
+        <button class="btn btn-ghost" data-act="exportFile">${esc(t('export.file'))}</button>
+      </div>
+      <div class="cap">${esc(t('export.jsonCaption'))}</div>
+      <div class="row-btns">
+        <button class="btn btn-ghost" data-act="exportJsonFile">${esc(t('export.jsonFile'))}</button>
+        <button class="btn btn-ghost" data-act="exportJsonCopy">${esc(t('export.jsonCopy'))}</button>
+      </div>
+      <label class="field"><span>${esc(t('export.preview'))}</span><textarea class="export-text" id="exportText" readonly rows="8">${esc(planExportText())}</textarea></label>
+      <button class="btn btn-ghost" data-act="closeSheet">${esc(t('common.done'))}</button>`);
+  }
+
+  if(ui.sheet === 'import'){
+    return wrap(`
+      <h2 class="display sheet-title">${esc(t('import.title'))}</h2>
+      <label class="btn btn-ghost file-btn">${esc(t('import.file'))}<input type="file" id="importFile" accept=".json,application/json" data-change="importFile"></label>
+      <label class="field"><span>${esc(t('import.paste'))}</span><textarea class="export-text" id="importText" rows="6" data-input="importText" spellcheck="false"></textarea></label>
+      <div class="import-result" id="importResult">${vImportResult()}</div>
+      <button class="btn btn-ghost" data-act="closeSheet">${esc(t('common.cancel'))}</button>`);
   }
 
   if(ui.sheet === 'regen'){
@@ -1810,6 +1850,208 @@ function vLibraryList(){
     ${showLib ? lib.map(e => `<button class="list-row" data-act="addLibraryExercise" data-arg="${esc(e.id)}"><i class="dot" style="background:${muscleColor(e.muscle)}"></i>
       <div class="grow"><b>${esc(e.name)}</b><small>${esc(t('muscle.' + e.muscle))} · ${esc(e.equipment.map(x => t('equipment.' + x)).join(', '))}</small></div>${icon('plus', 18)}</button>`).join('') : ''}`;
   return `${create}<div class="cap side">${esc(t('library.mine'))}</div>${mineHtml}${libHtml}`;
+}
+
+/* ---------- Plan exportieren ---------- */
+// Bewusst ohne E-Mail oder andere Kontodaten: nur Plan, Ziele und eine kurze Zusammenfassung des Trainings.
+const CLAUDE_NEW_CHAT_URL = 'https://claude.ai/new?q=';
+const CLAUDE_URL_LIMIT = 4000; // Eine feste Grenze ist nicht dokumentiert; laengere Plaene gehen ueber die Zwischenablage.
+function exportDays(){
+  const day = ui.exportDayId ? state.plan.days.find(d => d.id === ui.exportDayId) : null;
+  return day ? [day] : state.plan.days;
+}
+function exportAmount(ex, r, w){
+  if(ex.unit === 'seconds') return w > 0 ? t('export.secondsWeight', {s: r, w: fmtKg(w)}) : t('export.seconds', {s: r});
+  return w > 0 ? t('export.repsWeight', {r, w: fmtKg(w)}) : t('export.reps', {r});
+}
+// Eine Zeile pro Uebung in ganzen Worten, damit der Text ohne Erklaerung verstaendlich ist.
+function exportExerciseLine(day, ex, i){
+  const g = groupInfo(day, i);
+  const strength = dayType(day) === 'strength';
+  const pause = effectiveSetPause(ex, day);
+  const parts = [];
+  if(strength){
+    if(ex.setPlan && ex.setPlan.length) parts.push(ex.setPlan.map((p, k) => t('export.perSet', {n: k + 1, what: exportAmount(ex, p.r, p.w || 0)})).join('; '));
+    else parts.push(g.inGroup ? exportAmount(ex, ex.reps, ex.weight || 0) : `${t(ex.sets === 1 ? 'export.set1' : 'export.setsN', {n: ex.sets})}: ${exportAmount(ex, ex.reps, ex.weight || 0)}`);
+    parts.push(pause > 0 ? t('export.restReco', {time: formatClock(pause)}) : t('export.directThen'));
+  } else if(g.inGroup){
+    parts.push(t('export.seconds', {s: ex.seconds}));
+    parts.push(g.last ? t('export.roundThen', {s: pause}) : pause > 0 ? t('export.switchThen', {s: pause}) : t('export.directThen'));
+  } else {
+    parts.push(`${t(ex.sets === 1 ? 'export.set1' : 'export.setsN', {n: ex.sets})}: ${t('export.seconds', {s: ex.seconds})}`);
+    if(ex.sets > 1) parts.push(t('export.restBetween', {s: pause}));
+  }
+  if(!strength && g.last && i < day.exercises.length - 1) parts.push(t(g.inGroup ? 'export.groupThen' : 'export.then', {s: effectivePauseAfter(ex, day)}));
+  const tag = g.inGroup ? g.letter + g.pos : String(i + 1);
+  return `${g.inGroup ? '  ' : ''}${tag}. ${ex.name || t('exercise.namePlaceholder')} (${t('muscle.' + ex.muscle)}): ${parts.join(', ')}`;
+}
+function planExportText(){
+  const lines = [t('export.fileTitle')];
+  const goals = [];
+  if(onboarding.focus.length) goals.push(`${t('onboarding.focus')}: ${onboarding.focus.map(x => t('focus.' + x)).join(', ')}`);
+  if(onboarding.equipment.length) goals.push(`${t('onboarding.equipment')}: ${onboarding.equipment.map(x => t('equipment.' + x)).join(', ')}`);
+  if(onboarding.daysPerWeek) goals.push(`${t('onboarding.daysPerWeek')}: ${onboarding.daysPerWeek}`);
+  if(onboarding.sessionMinutes) goals.push(`${t('onboarding.sessionMinutes')}: ${onboarding.sessionMinutes}`);
+  if(onboarding.constraints) goals.push(`${t('onboarding.constraints')}: ${onboarding.constraints}`);
+  if(goals.length) lines.push('', `${t('onboarding.title')}:`, ...goals.map(x => '- ' + x));
+  exportDays().forEach(day => {
+    const type = t(dayType(day) === 'strength' ? 'train.typeStrength' : 'train.typeInterval');
+    lines.push('', t('export.dayHeading', {name: day.name || t('main.newDayName'), type, time: minutesLabel(dayTotalSeconds(day))}));
+    day.exercises.forEach((ex, i) => {
+      const g = groupInfo(day, i);
+      if(g.inGroup && g.first) lines.push(t('export.groupHeading', {letter: g.letter, n: ex.sets}));
+      lines.push(exportExerciseLine(day, ex, i));
+    });
+  });
+  const since30 = new Date(Date.now() - 30 * 864e5);
+  const recent = completedSessions().filter(x => sessionDate(x) >= since30);
+  if(recent.length){
+    const hours = recent.reduce((a, x) => a + (x.elapsedSeconds || 0), 0) / 3600;
+    const week = muscleHistory().sets;
+    const perMuscle = Object.keys(week).filter(m => m !== 'warmup' && m !== 'stretch').map(m => `${t('muscle.' + m)} ${week[m]}`).join(', ');
+    lines.push('', `${t('stats.title')}:`, `- ${t('stats.sessions30')}: ${recent.length} (${hours.toFixed(1).replace('.', currentLanguage === 'en' ? '.' : ',')} h)`);
+    if(perMuscle) lines.push(`- ${t('export.weekSets')}: ${perMuscle}`);
+  }
+  return lines.join('\n');
+}
+function claudeMessage(){ return `${t(ui.exportDayId ? 'export.promptDay' : 'export.prompt')}\n\n${planExportText()}`; }
+function exportBaseName(){
+  const day = ui.exportDayId ? state.plan.days.find(d => d.id === ui.exportDayId) : null;
+  const name = day && day.name ? '-' + day.name.toLowerCase().replace(/[^a-z0-9äöüß]+/g, '-').replace(/^-|-$/g, '') : '';
+  return `${t('export.fileName')}${name}-${new Date().toISOString().slice(0, 10)}`;
+}
+function downloadFile(name, content, type){
+  const url = URL.createObjectURL(new Blob([content], { type }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+/* ---------- JSON-Format (Beschreibung: PLAN_FORMAT.md) ---------- */
+const PLAN_FORMAT_ID = 'intervalinator-plan';
+const PLAN_FORMAT_VERSION = 1;
+function exportPlanJson(){
+  const plan = state.plan;
+  const days = exportDays().map(day => {
+    const strength = dayType(day) === 'strength';
+    let letterIdx = 0;
+    const groupLetters = {};
+    return { name: day.name || '', type: dayType(day), exercises: day.exercises.map(ex => {
+      const out = { name: ex.name || '', muscle: ex.muscle };
+      if(ex.groupId){
+        if(!groupLetters[ex.groupId]) groupLetters[ex.groupId] = String.fromCharCode(65 + letterIdx++);
+        out.group = groupLetters[ex.groupId];
+      }
+      out.sets = ex.sets;
+      if(strength){
+        out.unit = ex.unit === 'seconds' ? 'seconds' : 'reps';
+        if(ex.setPlan && ex.setPlan.length) out.setPlan = ex.setPlan.map(p => ({ amount: p.r, weightKg: p.w || 0 }));
+        else { out.amount = ex.reps; out.weightKg = ex.weight || 0; }
+      } else out.seconds = ex.seconds;
+      if(ex.setPauseOverride != null) out.setPauseSeconds = ex.setPauseOverride;
+      if(!strength && ex.pauseAfterOverride != null) out.pauseAfterSeconds = ex.pauseAfterOverride;
+      return out;
+    }) };
+  });
+  return JSON.stringify({
+    format: PLAN_FORMAT_ID, version: PLAN_FORMAT_VERSION, exportedAt: new Date().toISOString(),
+    defaults: { setPauseSeconds: plan.setPauseSeconds, exercisePauseSeconds: plan.pauseSeconds, groupSwitchSeconds: plan.groupSwitchSeconds, strengthRestSeconds: plan.strengthRestSeconds },
+    days
+  }, null, 2);
+}
+function importNumber(v, min, max, fallback){
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : fallback;
+}
+// Prueft eine Plandatei und baut daraus saubere Tage. Fremde Dateien werden nie ungeprueft uebernommen.
+function parsePlanJson(text){
+  let data;
+  try{ data = JSON.parse(text); }catch(e){ return { error: t('import.errJson') }; }
+  if(!data || data.format !== PLAN_FORMAT_ID) return { error: t('import.errFormat') };
+  if(!(data.version >= 1) || data.version > PLAN_FORMAT_VERSION) return { error: t('import.errVersion') };
+  const rawDays = Array.isArray(data.days) ? data.days.slice(0, 50) : [];
+  const days = rawDays.filter(d => d && Array.isArray(d.exercises)).map(d => {
+    const type = d.type === 'strength' ? 'strength' : 'interval';
+    const ids = {};
+    const day = { id: uid(), name: String(d.name || t('main.newDayName')).slice(0, 80), type, exercises: d.exercises.slice(0, 100).filter(Boolean).map(e => {
+      const muscle = MUSCLE_GROUP_IDS.includes(e.muscle) ? e.muscle : 'other';
+      const ex = makeExercise(String(e.name || '').slice(0, 120), muscle, importNumber(e.sets, 1, 20, 3), importNumber(e.seconds, 1, 3600, 30));
+      ex.id = uid();
+      if(e.group != null && String(e.group)){ const key = String(e.group); ids[key] = ids[key] || uid(); ex.groupId = ids[key]; }
+      if(e.setPauseSeconds != null) ex.setPauseOverride = importNumber(e.setPauseSeconds, 0, 600, null);
+      if(e.pauseAfterSeconds != null) ex.pauseAfterOverride = importNumber(e.pauseAfterSeconds, 0, 600, null);
+      if(type === 'strength'){
+        ex.unit = e.unit === 'seconds' ? 'seconds' : 'reps';
+        ex.reps = importNumber(e.amount, 1, 600, 10);
+        ex.weight = importNumber(e.weightKg, 0, 2000, 0);
+        if(Array.isArray(e.setPlan) && e.setPlan.length){
+          ex.setPlan = e.setPlan.slice(0, 20).map(p => ({ r: importNumber(p && p.amount, 1, 600, 10), w: importNumber(p && p.weightKg, 0, 2000, 0) }));
+          ex.reps = ex.setPlan[0].r; ex.weight = ex.setPlan[0].w; ex.sets = ex.setPlan.length;
+        }
+      }
+      return ex;
+    }) };
+    normalizeGroups(day);
+    day.exercises.forEach(syncSetPlan);
+    return day;
+  });
+  if(!days.length) return { error: t('import.errEmpty') };
+  const dflt = data.defaults || {};
+  return { days, defaults: {
+    setPauseSeconds: importNumber(dflt.setPauseSeconds, 0, 600, state.plan.setPauseSeconds),
+    pauseSeconds: importNumber(dflt.exercisePauseSeconds, 0, 600, state.plan.pauseSeconds),
+    groupSwitchSeconds: importNumber(dflt.groupSwitchSeconds, 0, 600, state.plan.groupSwitchSeconds),
+    strengthRestSeconds: importNumber(dflt.strengthRestSeconds, 0, 600, state.plan.strengthRestSeconds)
+  } };
+}
+// Beim Hinzufuegen gelten die Standardpausen des eigenen Plans: Weichen die der Datei ab, als eigene Werte festhalten.
+function keepImportedPauses(day, defaults){
+  const strength = day.type === 'strength';
+  day.exercises.forEach((ex, i) => {
+    const g = groupInfo(day, i);
+    const fromFile = g.inGroup && !g.last ? (strength ? 0 : defaults.groupSwitchSeconds) : (strength ? defaults.strengthRestSeconds : defaults.setPauseSeconds);
+    if(ex.setPauseOverride == null && fromFile !== defaultSetPause(ex, day)) ex.setPauseOverride = fromFile;
+    if(!strength && ex.pauseAfterOverride == null && defaults.pauseSeconds !== state.plan.pauseSeconds) ex.pauseAfterOverride = defaults.pauseSeconds;
+  });
+}
+function vImportResult(){
+  const res = ui.importResult;
+  if(!res) return '';
+  if(res.error) return `<div class="msg msg-error" role="alert">${esc(res.error)}</div>`;
+  const exCount = res.days.reduce((a, d) => a + d.exercises.length, 0);
+  return `<div class="msg msg-info" role="status">${esc(t('import.found', {days: res.days.length, ex: exCount}))}<br>${esc(res.days.map(d => d.name).join(', '))}</div>
+    <button class="btn btn-primary" data-act="importAdd">${esc(t('import.add'))}</button>
+    ${state.plan.days.length === 0 ? '' : ui.importConfirmReplace
+      ? `<div class="msg msg-error">${esc(t('import.replaceWarn', {n: state.plan.days.length}))}</div>
+         <div class="row-btns"><button class="btn btn-ghost" data-act="importCancelReplace">${esc(t('common.cancel'))}</button><button class="btn btn-danger" data-act="importReplace">${esc(t('import.replaceConfirm'))}</button></div>`
+      : `<button class="btn btn-ghost" data-act="importAskReplace">${esc(t('import.replace'))}</button>`}`;
+}
+function refreshImportResult(){ const box = document.getElementById('importResult'); if(box) box.innerHTML = vImportResult(); }
+function finishImport(days, message){
+  days.forEach(d => d.exercises.forEach(ex => upsertMyExercise(state.plan, ex)));
+  state.activeDayId = days[0].id;
+  ui.sheet = null; ui.importResult = null; ui.importConfirmReplace = false; ui.tab = 'train';
+  schedulePersist();
+  render();
+  showToast(message);
+}
+async function copyText(text){
+  try{
+    await navigator.clipboard.writeText(text);
+    return true;
+  }catch(e){
+    const box = document.getElementById('exportText');
+    if(!box) return false;
+    const before = box.value;
+    box.value = text;
+    box.focus(); box.select();
+    setTimeout(() => { box.value = before; }, 0);
+    try{ return document.execCommand('copy'); }catch(e2){ return false; }
+  }
 }
 
 /* ---------- Aktionen ---------- */
@@ -2072,6 +2314,55 @@ const ACTIONS = {
   setTheme(theme){ applyTheme(theme); settings.theme = theme === 'system' ? null : theme; scheduleSettingsPersist(); rerender(); },
   togglePw(){ ui.pwOpen = !ui.pwOpen; rerender(); },
   changePassword(){ handleChangePassword(drafts.curPw, drafts.newPw).then(() => { if(profileInfo){ drafts.curPw = ''; drafts.newPw = ''; ui.pwOpen = false; rerender(); } }); },
+  openExport(dayId){ ui.exportDayId = dayId || null; ui.exportInfo = ''; openSheet('export'); },
+  exportClaude(){
+    const message = claudeMessage();
+    // Passt der Plan in den Link, steht er direkt im Chat. Sonst bleibt er in der Zwischenablage zum Einfuegen.
+    const full = CLAUDE_NEW_CHAT_URL + encodeURIComponent(message);
+    const fits = full.length <= CLAUDE_URL_LIMIT;
+    copyText(message);
+    window.open(fits ? full : CLAUDE_NEW_CHAT_URL + encodeURIComponent(t('export.pasteIntro')), '_blank', 'noopener');
+    ui.exportInfo = t(fits ? 'export.infoLink' : 'export.infoPaste');
+    rerender();
+  },
+  exportCopy(){
+    copyText(claudeMessage()).then(ok => { ui.exportInfo = t(ok ? 'export.copied' : 'export.copyFailed'); rerender(); });
+  },
+  exportShare(){
+    navigator.share({ title: t('export.fileTitle'), text: claudeMessage() }).catch(() => {});
+  },
+  exportFile(){ downloadFile(exportBaseName() + '.txt', planExportText(), 'text/plain;charset=utf-8'); },
+  exportJsonFile(){ downloadFile(exportBaseName() + '.json', exportPlanJson(), 'application/json'); },
+  exportJsonCopy(){
+    copyText(exportPlanJson()).then(ok => { ui.exportInfo = t(ok ? 'export.copied' : 'export.copyFailed'); rerender(); });
+  },
+  openImport(emptyDayId){ ui.importEmptyDayId = emptyDayId || null; ui.importResult = null; ui.importConfirmReplace = false; openSheet('import'); },
+  importAskReplace(){ ui.importConfirmReplace = true; refreshImportResult(); },
+  importCancelReplace(){ ui.importConfirmReplace = false; refreshImportResult(); },
+  importAdd(){
+    const res = ui.importResult;
+    if(!res || !res.days) return;
+    // Aus einem neuen, leeren Tag heraus importiert: Der Import ersetzt diesen Tag, statt ihn leer stehen zu lassen.
+    state.plan.days = state.plan.days.filter(d => !(d.id === ui.importEmptyDayId && !d.exercises.length));
+    const taken = new Set(state.plan.days.map(d => d.name));
+    res.days.forEach(day => {
+      // Gleiche Namen vermeiden: "Dran" und Statistik ordnen Trainings ueber den Tagesnamen zu.
+      let name = day.name, n = 2;
+      while(taken.has(name)) name = `${day.name} (${n++})`;
+      day.name = name;
+      taken.add(name);
+      keepImportedPauses(day, res.defaults);
+      state.plan.days.push(day);
+    });
+    finishImport(res.days, t('import.added', {n: res.days.length}));
+  },
+  importReplace(){
+    const res = ui.importResult;
+    if(!res || !res.days) return;
+    Object.assign(state.plan, res.defaults);
+    state.plan.days = res.days;
+    finishImport(res.days, t('import.added', {n: res.days.length}));
+  },
   openDeleteAccount(){ drafts.deletePw = ''; openSheet('deleteAccount'); },
   confirmDeleteAccount(){ const pw = drafts.deletePw; drafts.deletePw = ''; ui.sheet = null; render(); handleDeleteAccount(pw); }
 };
@@ -2085,6 +2376,7 @@ const INPUTS = {
   exName(v){ const ex = currentExercise(); if(ex){ ex.name = v; schedulePersist(); } },
   dayName(v){ const d = activeDay(); if(d){ d.name = v; schedulePersist(); } },
   exWeight(v){ const ex = currentExercise(); if(ex){ const n = parseFloat(String(v).replace(',', '.')); ex.weight = isNaN(n) || n < 0 ? 0 : n; schedulePersist(); } },
+  importText(v){ ui.importConfirmReplace = false; ui.importResult = v.trim() ? parsePlanJson(v) : null; refreshImportResult(); },
   libQuery(v){ ui.libQuery = v; refreshLibraryList(); },
   constraints(v){ onboarding.constraints = v; scheduleOnboardingPersist(); }
 };
@@ -2103,6 +2395,13 @@ document.addEventListener('input', (e) => {
 });
 document.addEventListener('change', (e) => {
   if(e.target.dataset && e.target.dataset.change === 'language') setLanguage(e.target.value);
+  if(e.target.dataset && e.target.dataset.change === 'importFile' && e.target.files && e.target.files[0]){
+    e.target.files[0].text().then(text => {
+      const box = document.getElementById('importText');
+      if(box) box.value = text;
+      INPUTS.importText(text);
+    }).catch(() => { ui.importResult = { error: t('import.errJson') }; refreshImportResult(); });
+  }
 });
 document.addEventListener('keydown', (e) => {
   if(e.key === 'Escape' && ui.sheet){ if(ui.sheet === 'stop') ACTIONS.resumeFromStop(); else closeSheet(); return; }
